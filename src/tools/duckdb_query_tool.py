@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import csv
 import re
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import duckdb
 from smolagents import Tool
@@ -14,7 +15,20 @@ from .duckdb_schema_manager import SchemaManager
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASES_ROOT = PROJECT_ROOT / "databases"
 
-__all__ = ["DuckDBQueryTool", "DEFAULT_DATABASES_ROOT"]
+__all__ = ["DuckDBQueryTool", "DEFAULT_DATABASES_ROOT", "StructuredQueryResult"]
+
+
+@dataclass(slots=True)
+class StructuredQueryResult:
+    """Structured DuckDB query response suitable for JSON serialisation."""
+
+    columns: list[str]
+    rows: list[list[Any]]
+    row_count: int
+    truncated: bool
+    database: Optional[str] = None
+    project: Optional[str] = None
+    message: Optional[str] = None
 
 
 class DuckDBQueryTool(Tool):
@@ -29,23 +43,46 @@ class DuckDBQueryTool(Tool):
     inputs = {
         "sql": {
             "type": "string",
-            "description": "SQL query to execute. Leave empty to only list available DuckDB databases.",
+            "description": (
+                "SQL query to execute. Leave empty to only list available DuckDB databases."
+            ),
             "nullable": True,
         },
         "database": {
             "type": "string",
-            "description": "Optional path or filename of the DuckDB file to query. "
-            "If omitted, the tool selects the configured default or the sole discovered database.",
+            "description": (
+                "Optional path or filename of the DuckDB file to query. "
+                "If omitted, the tool selects the configured default or the sole discovered database."
+            ),
             "nullable": True,
         },
         "list_only": {
             "type": "boolean",
-            "description": "When true, only returns the list of discovered DuckDB databases without executing SQL.",
+            "description": (
+                "When true, only returns the list of discovered DuckDB databases without executing SQL."
+            ),
+            "nullable": True,
+        },
+        "create_project": {
+            "type": "boolean",
+            "description": (
+                "When true, creates a new DuckDB project "
+                "(provide the desired project name via the 'project' field)."
+            ),
             "nullable": True,
         },
         "project": {
             "type": "string",
-            "description": "Project name (DuckDB file name without extension) to target when multiple databases exist.",
+            "description": (
+                "Project name (DuckDB file name without extension) to target when multiple databases exist."
+            ),
+            "nullable": True,
+        },
+        "project_description": {
+            "type": "string",
+            "description": (
+                "Optional description to store alongside the project metadata when creating a new project."
+            ),
             "nullable": True,
         },
         "output_format": {
@@ -56,6 +93,14 @@ class DuckDBQueryTool(Tool):
         "csv_path": {
             "type": "string",
             "description": "Optional filesystem path to export results as CSV.",
+            "nullable": True,
+        },
+        "plan": {
+            "type": "string",
+            "description": (
+                "Implementation plan explaining the reasoning behind this query "
+                "(tables chosen, joins, filters, etc.)."
+            ),
             "nullable": True,
         },
     }
@@ -87,11 +132,22 @@ class DuckDBQueryTool(Tool):
         sql: str = "",
         database: Optional[str] = None,
         list_only: bool = False,
+        create_project: Optional[bool] = False,
         project: Optional[str] = None,
         output_format: str = "text",
         csv_path: Optional[str] = None,
+        project_description: Optional[str] = None,
+        plan: Optional[str] = None,
     ) -> str:
         available = self._discover_databases()
+
+        if create_project:
+            if not project or not project.strip():
+                raise ValueError("To create a project, supply the desired project name via the 'project' argument.")
+            created_path = self._create_project(project, description=project_description or "")
+            self.current_database = created_path
+            self.schema_manager.set_database(created_path)
+            return f"Created new DuckDB project at {created_path}"
 
         if list_only or not sql.strip():
             return self._format_discovery(available)
@@ -101,6 +157,7 @@ class DuckDBQueryTool(Tool):
         if format_choice not in {"text", "table", "csv"}:
             raise ValueError("output_format must be one of: 'text', 'table', or 'csv'.")
 
+        self.current_database = target
         self.schema_manager.set_database(target)
         try:
             with duckdb.connect(str(target)) as conn:
@@ -142,12 +199,9 @@ class DuckDBQueryTool(Tool):
             if tables_in_query
             else self.schema_manager.project_summary()
         )
-        footer = "\n" + self._format_discovery(available)
-        self.current_database = target
         result_text = header + formatted + export_note
         if schema_info:
             result_text += "\n" + schema_info
-        result_text += footer
         return result_text
 
     # Helper methods -----------------------------------------------------
@@ -201,14 +255,29 @@ class DuckDBQueryTool(Tool):
                 raise ValueError("Provided project name is empty. Supply a valid project identifier.")
 
             for path in available:
+                # Check both stem and relative path for matches
                 if path.stem.lower() == normalized or path.name.lower() == normalized:
                     return path
+
+                # Also check relative path with subdirectories
+                for root in self.search_roots:
+                    try:
+                        rel = path.relative_to(root)
+                        rel_name = str(rel.with_suffix("")).replace("\\", "/").lower()
+                        if rel_name == normalized:
+                            return path
+                    except ValueError:
+                        continue
 
             available_projects = ", ".join(path.stem for path in available) or "<none>"
             raise ValueError(
                 f"Project '{project}' was not found. Available projects: {available_projects}. "
                 "Use project=<name> matching a DuckDB file."
             )
+
+        # If current_database is already set (from UI), use it
+        if self.current_database and self.current_database.exists():
+            return self.current_database
 
         if self.default_database and self.default_database.exists():
             return self.default_database
@@ -231,9 +300,8 @@ class DuckDBQueryTool(Tool):
         if not available:
             return "No DuckDB databases found under the configured search roots."
 
-        lines = ["Discovered DuckDB databases:"]
-        lines.extend(f"- {path} (project: {path.stem})" for path in available)
-        return "\n".join(lines)
+        # Return a minimal response without the full list (the list is shown in UI)
+        return f"Found {len(available)} DuckDB project(s). Use the UI to select a project."
 
     @staticmethod
     def _format_table(columns: List[str], rows: List[tuple]) -> str:
@@ -279,6 +347,165 @@ class DuckDBQueryTool(Tool):
         if value is None:
             return ""
         return str(value)
+
+    def _slugify(self, value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
+        return cleaned.lower()
+
+    def _create_project(self, name: str, *, description: str = "") -> Path:
+        display_name = name.strip()
+        if not display_name:
+            raise ValueError("Project name must not be empty.")
+        slug = self._slugify(display_name)
+        if not slug:
+            raise ValueError("Project name must contain alphanumeric characters.")
+
+        root = self.search_roots[0] if self.search_roots else DEFAULT_DATABASES_ROOT
+        root.mkdir(parents=True, exist_ok=True)
+
+        candidate = root / f"{slug}.duckdb"
+        counter = 1
+        while candidate.exists():
+            candidate = root / f"{slug}_{counter}.duckdb"
+            counter += 1
+
+        with duckdb.connect(str(candidate)) as conn:
+            conn.execute("SELECT 1")
+
+        manager = SchemaManager()
+        manager.set_database(candidate)
+        manager.set_project_metadata(display_name=display_name, description=description)
+        return candidate
+
+    @staticmethod
+    def _jsonify(value: object) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return value.hex()
+        return str(value)
+
+    def execute_structured(
+        self,
+        sql: str,
+        *,
+        database: Optional[str] = None,
+        project: Optional[str] = None,
+        result_limit: Optional[int] = None,
+    ) -> StructuredQueryResult:
+        """
+        Execute SQL and return structured results ready for JSON serialisation.
+
+        Parameters
+        ----------
+        sql:
+            SQL statement to execute. Required.
+        database/project:
+            Optional hints for the DuckDB file to target.
+        result_limit:
+            Optional maximum number of rows to include in the response. When exceeded the data is truncated.
+        """
+
+        if not sql or not sql.strip():
+            raise ValueError("SQL query is required.")
+
+        available = self._discover_databases()
+        target = self._resolve_database(database, project, available)
+
+        self.current_database = target
+        self.schema_manager.set_database(target)
+
+        try:
+            with duckdb.connect(str(target)) as conn:
+                cursor = conn.execute(sql)
+                description = cursor.description
+                if not description:
+                    conn.commit()
+                    return StructuredQueryResult(
+                        columns=[],
+                        rows=[],
+                        row_count=0,
+                        truncated=False,
+                        database=str(target),
+                        project=target.stem,
+                        message="Statement executed successfully (no result set returned).",
+                    )
+
+                columns = [column[0] for column in description]
+                fetched_rows = cursor.fetchall()
+        except duckdb.Error as exc:
+            raise ValueError(f"DuckDB execution error: {exc}") from exc
+
+        total_rows = len(fetched_rows)
+        truncated = False
+        if result_limit is not None and result_limit >= 0 and total_rows > result_limit:
+            fetched_rows = fetched_rows[:result_limit]
+            truncated = True
+
+        serialised_rows = [
+            [self._jsonify(value) for value in row] for row in fetched_rows
+        ]
+
+        return StructuredQueryResult(
+            columns=columns,
+            rows=serialised_rows,
+            row_count=total_rows,
+            truncated=truncated,
+            database=str(target),
+            project=target.stem,
+            message=None,
+        )
+
+    def list_tables_in_database(self, *, include_views: bool = False) -> List[str]:
+        """
+        Return the ordered list of tables (and optionally views) present in the active DuckDB database.
+
+        Parameters
+        ----------
+        include_views:
+            When ``True`` also returns views alongside base tables.
+        """
+
+        if not self.current_database:
+            raise ValueError("No DuckDB database selected. Choose a project first.")
+
+        table_types: list[str] = ["BASE TABLE"]
+        if include_views:
+            table_types.append("VIEW")
+
+        placeholders_tables = ", ".join("?" for _ in table_types)
+        schema_exclusions = ["information_schema", "pg_catalog"]
+        placeholders_schemas = ", ".join("?" for _ in schema_exclusions)
+
+        query = f"""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_type IN ({placeholders_tables})
+              AND table_schema NOT IN ({placeholders_schemas})
+            ORDER BY lower(table_schema), lower(table_name), table_name
+        """
+
+        try:
+            with duckdb.connect(str(self.current_database)) as conn:
+                rows = conn.execute(query, table_types + schema_exclusions).fetchall()
+        except duckdb.Error as exc:
+            raise ValueError(f"Failed to read tables from DuckDB: {exc}") from exc
+
+        results: list[str] = []
+        for schema, name in rows:
+            schema_name = str(schema or "").strip()
+            table_name = str(name or "").strip()
+            if not table_name:
+                continue
+
+            if schema_name and schema_name.lower() not in {"main"}:
+                results.append(f"{schema_name}.{table_name}")
+            else:
+                results.append(table_name)
+
+        return results
 
     @property
     def current_project(self) -> Optional[str]:

@@ -1,91 +1,479 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
+from openai import AzureOpenAI
 
 try:
     if __package__:
-        from .tools.duckdb_diagram_tool import DuckDBDiagramTool
+        from .tools.duckdb_chart_tool import DuckDBChartTool
         from .tools.duckdb_query_tool import DEFAULT_DATABASES_ROOT, DuckDBQueryTool
         from .tools.duckdb_schema_tool import DuckDBSchemaTool
-        from .tools.duckdb_ui_tool import DuckDBLaunchUITool
     else:  # pragma: no cover - script entry compatibility
-        from tools.duckdb_diagram_tool import DuckDBDiagramTool
+        from tools.duckdb_chart_tool import DuckDBChartTool
         from tools.duckdb_query_tool import DEFAULT_DATABASES_ROOT, DuckDBQueryTool
         from tools.duckdb_schema_tool import DuckDBSchemaTool
-        from tools.duckdb_ui_tool import DuckDBLaunchUITool
 except ImportError:  # pragma: no cover - fallback when executed directly
     # Allow execution via `python agent.py` from the src directory
     sys.path.append(str(Path(__file__).resolve().parent))
-    from tools.duckdb_diagram_tool import DuckDBDiagramTool
+    from tools.duckdb_chart_tool import DuckDBChartTool
     from tools.duckdb_query_tool import DEFAULT_DATABASES_ROOT, DuckDBQueryTool
     from tools.duckdb_schema_tool import DuckDBSchemaTool
-    from tools.duckdb_ui_tool import DuckDBLaunchUITool
-
-try:
-    from smolagents import CodeAgent
-    from smolagents.models import AzureOpenAIServerModel
-except ImportError as exc:  # pragma: no cover - dependency guard
-    raise ImportError(
-        "The 'smolagents' package is required. Install it with `pip install smolagents[duckdb]`."
-    ) from exc
-else:
-    try:
-        from smolagents import models as _smol_models
-    except ImportError:  # pragma: no cover - safety net
-        _smol_models = None
-    else:
-        _original_supports_stop_parameter = _smol_models.supports_stop_parameter
-
-        def _patched_supports_stop_parameter(model_id: str) -> bool:
-            if model_id and model_id.split("/")[-1].startswith("gpt-5"):
-                return False
-            return _original_supports_stop_parameter(model_id)
-
-        _smol_models.supports_stop_parameter = _patched_supports_stop_parameter
 
 DEFAULT_AZURE_ENDPOINT = "https://slagousis-eastus-resource.cognitiveservices.azure.com/"
 BOOL_TRUE = {"1", "true", "yes", "on"}
 
 __all__ = [
+    "DuckDBChartTool",
     "DuckDBQueryTool",
     "DuckDBSchemaTool",
-    "DuckDBDiagramTool",
-    "DuckDBLaunchUITool",
+    "DuckDBWorkspaceConfig",
+    "DuckDBComponents",
+    "resolve_duckdb_workspace",
+    "create_duckdb_components",
     "create_duckdb_agent",
     "run_agent",
     "main",
 ]
 
 
-class SchemaAwareCodeAgent(CodeAgent):
-    """CodeAgent that relies on explicit tool calls for schema access instead of auto-injecting metadata."""
+class DirectOpenAIAgent:
+    """Agent using Azure OpenAI function calling for DuckDB queries."""
 
-    def __init__(self, *, schema_tool: DuckDBSchemaTool, **kwargs) -> None:
-        self._system_prompt: Optional[str] = kwargs.pop("system_prompt", None)
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        *,
+        client: AzureOpenAI,
+        model: str,
+        query_tool: DuckDBQueryTool,
+        schema_tool: DuckDBSchemaTool,
+        chart_tool: DuckDBChartTool,
+        system_prompt: str,
+        max_iterations: int = 10,
+    ) -> None:
+        self.client = client
+        self.model = model
+        self.query_tool = query_tool
         self.schema_tool = schema_tool
-        self._system_prompt_shared = False
+        self.chart_tool = chart_tool
+        self.system_prompt = system_prompt
+        self.max_iterations = max_iterations
+        self._last_sql_query: Optional[str] = None
+        self._last_implementation_plan: Optional[str] = None
+        self.conversation_history: List[Dict[str, Any]] = []
+        self.execution_metadata: Dict[str, Any] = {}
 
-    def run(self, prompt: str, *, reset: bool = False, **kwargs):
+        # Link tools back to agent for SQL/plan capture
+        self.query_tool._agent_ref = self  # type: ignore[attr-defined]
+        self.schema_tool._agent_ref = self  # type: ignore[attr-defined]
+        self.chart_tool._agent_ref = self  # type: ignore[attr-defined]
+
+        # Define function schemas
+        self.functions = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "duckdb_query",
+                    "description": "Execute a SQL query against the DuckDB database and return results",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "The SQL query to execute"
+                            },
+                            "plan": {
+                                "type": "string",
+                                "description": (
+                                    "Implementation plan explaining table selection, columns, "
+                                    "joins, filters, and reasoning"
+                                )
+                            }
+                        },
+                        "required": ["sql"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "duckdb_schema",
+                    "description": (
+                        "Get schema information about tables, fields, relationships, and saved queries. "
+                        "Use before writing SQL to understand database structure."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": [
+                                    "list_tables",
+                                    "list_fields",
+                                    "get_table_info",
+                                    "list_saved_queries",
+                                    "get_full_schema"
+                                ],
+                                "description": (
+                                    "list_tables: show all tables, "
+                                    "list_fields: show fields for a table, "
+                                    "get_table_info: detailed info with relationships, "
+                                    "list_saved_queries: show saved SQL queries, "
+                                    "get_full_schema: complete schema summary"
+                                )
+                            },
+                            "table_name": {
+                                "type": "string",
+                                "description": "Table name (required for list_fields and get_table_info)"
+                            }
+                        },
+                        "required": ["action"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "duckdb_chart",
+                    "description": (
+                        "Execute a SQL query and return data formatted for chart visualization. "
+                        "Use this when the user explicitly requests a chart (bar, line, pie, scatter, area) "
+                        "or asks to visualize data graphically."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "The SQL query to execute for chart data"
+                            },
+                            "chart_type": {
+                                "type": "string",
+                                "enum": ["bar", "horizontal-bar", "line", "pie", "scatter", "area"],
+                                "description": "Type of chart to create"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Chart title (optional, will be auto-generated if not provided)"
+                            },
+                            "x_label": {
+                                "type": "string",
+                                "description": "X-axis label (optional, defaults to first column name)"
+                            },
+                            "y_label": {
+                                "type": "string",
+                                "description": "Y-axis label (optional, defaults to value column name)"
+                            },
+                            "plan": {
+                                "type": "string",
+                                "description": (
+                                    "Implementation plan explaining table selection, columns, "
+                                    "aggregations, and reasoning"
+                                )
+                            }
+                        },
+                        "required": ["sql", "chart_type"]
+                    }
+                }
+            }
+        ]
+
+    def run(self, prompt: str, *, reset: bool = False, **kwargs) -> str:
+        """Execute the agent with function calling loop."""
+        start_time = time.time()
+        tools_used = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        api_calls = 0
+
         if reset:
-            self._system_prompt_shared = False
+            self.conversation_history = []
+            self._last_sql_query = None
+            self._last_implementation_plan = None
 
-        segments: list[str] = []
+        # Clear last SQL and plan before running
+        self._last_sql_query = None
+        self._last_implementation_plan = None
 
-        if self._system_prompt and not self._system_prompt_shared:
-            segments.append(f"System instructions:\n{self._system_prompt}")
-            self._system_prompt_shared = True
+        # Add system message if conversation is empty
+        if not self.conversation_history:
+            self.conversation_history.append({
+                "role": "system",
+                "content": self.system_prompt
+            })
 
-        segments.append(f"User request:\n{prompt}")
-        prompt_to_send = "\n\n".join(segments)
+        # Add user message
+        self.conversation_history.append({
+            "role": "user",
+            "content": prompt
+        })
 
-        return super().run(prompt_to_send, reset=reset, **kwargs)
+        # Function calling loop
+        for iteration in range(self.max_iterations):
+            api_calls += 1
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.conversation_history,
+                tools=self.functions,
+                tool_choice="auto"
+            )
+
+            # Capture token usage
+            if hasattr(response, 'usage') and response.usage:
+                total_prompt_tokens += response.usage.prompt_tokens or 0
+                total_completion_tokens += response.usage.completion_tokens or 0
+
+            message = response.choices[0].message
+
+            # Add assistant message to history
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": message.tool_calls
+            })
+
+            # If no tool calls, we're done
+            if not message.tool_calls:
+                result = message.content or ""
+                break
+
+            # Execute tool calls
+            for tool_call in message.tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+
+                # Track tool usage
+                tools_used.append({
+                    "name": function_name,
+                    "arguments": function_args
+                })
+
+                # Execute the appropriate tool
+                if function_name == "duckdb_query":
+                    tool_result = self.query_tool(
+                        sql=function_args["sql"],
+                        plan=function_args.get("plan")
+                    )
+                elif function_name == "duckdb_schema":
+                    tool_result = self.schema_tool(
+                        action=function_args["action"],
+                        table_name=function_args.get("table_name")
+                    )
+                elif function_name == "duckdb_chart":
+                    tool_result = self.chart_tool(
+                        sql=function_args["sql"],
+                        chart_type=function_args.get("chart_type", "bar"),
+                        title=function_args.get("title", ""),
+                        x_label=function_args.get("x_label", ""),
+                        y_label=function_args.get("y_label", ""),
+                        plan=function_args.get("plan", "")
+                    )
+                else:
+                    tool_result = f"Unknown function: {function_name}"
+
+                # Add tool response to history
+                self.conversation_history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str(tool_result)
+                })
+        else:
+            # Max iterations reached
+            result = "Maximum iterations reached without completion."
+
+        # Calculate execution time
+        execution_time = time.time() - start_time
+
+        # Store execution metadata
+        self.execution_metadata = {
+            "tools_used": tools_used,
+            "total_tokens": total_prompt_tokens + total_completion_tokens,
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "api_calls": api_calls,
+            "execution_time_seconds": round(execution_time, 2),
+            "iterations": iteration + 1 if iteration < self.max_iterations else self.max_iterations,
+            "model": self.model
+        }
+
+        # Post-process: Check if chart tool was used and inject chart block
+        chart_tool_used = False
+        chart_json = None
+        for tool_usage in tools_used:
+            if tool_usage["name"] == "duckdb_chart":
+                chart_tool_used = True
+                # Find the corresponding tool result in conversation history
+                for msg in reversed(self.conversation_history):
+                    if msg.get("role") == "tool" and msg.get("content"):
+                        try:
+                            # Try to parse as JSON to verify it's chart data
+                            content = msg["content"]
+                            parsed = json.loads(content)
+                            if "chart_type" in parsed or "labels" in parsed:
+                                chart_json = content
+                                break
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+                break
+
+        if isinstance(result, str) and chart_tool_used and chart_json:
+            # Check if agent already included chart block
+            has_chart_block = "```chart" in result.lower()
+
+            # If no chart block, inject it
+            if not has_chart_block:
+                result = f"```chart\n{chart_json}\n```\n\n{result}"
+            else:
+                # If chart block exists, ensure it contains the SQL field
+                # If the agent stripped it, we should try to inject the full JSON
+                # This is a simple heuristic: if the tool result has 'sql' but the output block doesn't
+                if '"sql":' in chart_json and '"sql":' not in result:
+                    # Replace the first chart block with the full tool output
+                    import re
+                    pattern = re.compile(r"```chart\n[\s\S]*?```", re.IGNORECASE)
+                    result = pattern.sub(f"```chart\n{chart_json}\n```", result, count=1)
+
+        # Post-process: inject SQL and plan markers if captured
+        if self._last_sql_query and isinstance(result, str):
+            has_sql = "```sql" in result.lower()
+            has_plan = "[PLAN:" in result
+
+            # If agent didn't include SQL, prepend it
+            if not has_sql:
+                result = f"```sql\n{self._last_sql_query}\n```\n\n{result}"
+
+            # Add plan marker BEFORE the SQL block if we have one
+            if self._last_implementation_plan and not has_plan:
+                plan_marker = f"[PLAN:{self._last_implementation_plan}]"
+                sql_block_start = result.lower().find("```sql")
+                if sql_block_start >= 0:
+                    result = result[:sql_block_start] + plan_marker + "\n" + result[sql_block_start:]
+                else:
+                    result = f"{plan_marker}\n{result}"
+
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class DuckDBWorkspaceConfig:
+    """Resolved DuckDB workspace configuration shared by the CLI and the web server."""
+
+    search_roots: list[Path]
+    default_database: Optional[Path]
+    duckdb_executable: Optional[Path]
+
+
+@dataclass(slots=True)
+class DuckDBComponents:
+    """Concrete DuckDB tooling wired together for interactive usage."""
+
+    query_tool: DuckDBQueryTool
+    schema_tool: DuckDBSchemaTool
+    chart_tool: DuckDBChartTool
+
+
+def resolve_duckdb_workspace(
+    *,
+    search_roots: Iterable[str | Path] | None = None,
+    default_database: Optional[str | Path] = None,
+    duckdb_executable: Optional[str | Path] = None,
+) -> DuckDBWorkspaceConfig:
+    """
+    Resolve DuckDB workspace configuration from explicit arguments or environment variables.
+
+    This helper centralises configuration so both the CLI agent and the FastAPI server reuse the same logic.
+    """
+
+    load_dotenv()
+
+    if search_roots is None:
+        env_roots = os.environ.get("DUCKDB_SEARCH_ROOTS")
+        if env_roots:
+            roots_iterable = [Path(path.strip()) for path in env_roots.split(os.pathsep) if path.strip()]
+        else:
+            roots_iterable = [DEFAULT_DATABASES_ROOT]
+    else:
+        roots_iterable = [Path(path) for path in search_roots]
+
+    resolved_roots = [root.expanduser().resolve() for root in roots_iterable]
+
+    resolved_default: Optional[Path]
+    if default_database is None:
+        default_env = os.environ.get("DUCKDB_PATH")
+        resolved_default = Path(default_env).expanduser().resolve() if default_env else None
+    else:
+        resolved_default = Path(default_database).expanduser().resolve()
+
+    resolved_executable: Optional[Path]
+    if duckdb_executable is None:
+        env_executable = os.environ.get("DUCKDB_EXECUTABLE")
+        resolved_executable = Path(env_executable).expanduser().resolve() if env_executable else None
+    else:
+        resolved_executable = Path(duckdb_executable).expanduser().resolve()
+
+    return DuckDBWorkspaceConfig(
+        search_roots=resolved_roots,
+        default_database=resolved_default if resolved_default and resolved_default.exists() else resolved_default,
+        duckdb_executable=(
+            resolved_executable if resolved_executable and resolved_executable.exists() else resolved_executable
+        ),
+    )
+
+
+def create_duckdb_components(
+    config: DuckDBWorkspaceConfig,
+    *,
+    emit_status: bool = True,
+) -> DuckDBComponents:
+    """
+    Instantiate DuckDB tools using the provided workspace configuration.
+
+    Parameters
+    ----------
+    config:
+        Resolved workspace paths for DuckDB assets.
+    emit_status:
+        When true, prints console messages describing discovered projects (useful for the CLI).
+    """
+
+    tool = DuckDBQueryTool(
+        search_roots=config.search_roots,
+        default_database=config.default_database,
+    )
+    available_projects = tool.discover_databases()
+
+    if emit_status and tool.search_roots:
+        primary_root = tool.search_roots[0]
+        print(f"DuckDB databases directory: {primary_root}")
+        if len(tool.search_roots) > 1:
+            additional_roots = ", ".join(str(root) for root in tool.search_roots[1:])
+            print(f"Additional search roots: {additional_roots}")
+        print("Available DuckDB projects:")
+        if available_projects:
+            for path in available_projects:
+                print(f"- {path.stem}")
+        else:
+            print("- <none>")
+
+    schema_tool = DuckDBSchemaTool(tool)
+    chart_tool = DuckDBChartTool(
+        db_path=str(config.default_database) if config.default_database else None,
+        default_database=str(config.default_database) if config.default_database else None
+    )
+
+    return DuckDBComponents(
+        query_tool=tool,
+        schema_tool=schema_tool,
+        chart_tool=chart_tool,
+    )
 
 
 def create_duckdb_agent(
@@ -97,10 +485,11 @@ def create_duckdb_agent(
     search_roots: Iterable[str | Path] | None = None,
     default_database: Optional[str | Path] = None,
     duckdb_executable: Optional[str | Path] = None,
-    max_steps: int = 8,
-) -> CodeAgent:
+    max_steps: int = 10,
+    emit_status: bool = True,
+) -> DirectOpenAIAgent:
     """
-    Build a SMOL CodeAgent equipped with the DuckDBQueryTool.
+    Build a DirectOpenAIAgent equipped with DuckDB tools.
 
     Parameters
     ----------
@@ -121,10 +510,16 @@ def create_duckdb_agent(
     duckdb_executable:
         Path to the DuckDB CLI executable. Defaults to ``DUCKDB_EXECUTABLE`` if available.
     max_steps:
-        Maximum number of reasoning/tool-call iterations permitted for the agent.
+        Maximum number of function calling iterations permitted for the agent.
+    emit_status:
+        When true, prints DuckDB workspace information during initialization (defaults to True for CLI usage).
     """
 
-    load_dotenv()
+    config = resolve_duckdb_workspace(
+        search_roots=search_roots,
+        default_database=default_database,
+        duckdb_executable=duckdb_executable,
+    )
 
     model_name = model_name or os.environ.get("AZURE_OPENAI_DEPLOYMENT") or "gpt-5"
     azure_endpoint = azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT") or DEFAULT_AZURE_ENDPOINT
@@ -139,122 +534,162 @@ def create_duckdb_agent(
             "Azure OpenAI API version is required. Set AZURE_OPENAI_API_VERSION in your environment variables."
         )
 
-    if search_roots is None:
-        env_roots = os.environ.get("DUCKDB_SEARCH_ROOTS")
-        if env_roots:
-            search_roots = [Path(path.strip()) for path in env_roots.split(os.pathsep) if path.strip()]
-        else:
-            search_roots = [DEFAULT_DATABASES_ROOT]
-    else:
-        search_roots = [Path(path) for path in search_roots]
+    components = create_duckdb_components(config, emit_status=emit_status)
+    tool = components.query_tool
+    schema_tool = components.schema_tool
+    chart_tool = components.chart_tool
 
-    if default_database is None:
-        default_env = os.environ.get("DUCKDB_PATH")
-        default_database = Path(default_env) if default_env else None
-    else:
-        default_database = Path(default_database)
-
-    if duckdb_executable is None:
-        env_executable = os.environ.get("DUCKDB_EXECUTABLE")
-        duckdb_executable_path = Path(env_executable) if env_executable else None
-    else:
-        duckdb_executable_path = Path(duckdb_executable)
-
-    tool = DuckDBQueryTool(
-        search_roots=[Path(root) for root in search_roots],
-        default_database=default_database,
-    )
-    if tool.search_roots:
-        primary_root = tool.search_roots[0]
-        print(f"DuckDB databases directory: {primary_root}")
-        if len(tool.search_roots) > 1:
-            additional_roots = ", ".join(str(root) for root in tool.search_roots[1:])
-            print(f"Additional search roots: {additional_roots}")
-    available_projects = tool.discover_databases()
-    print("Available DuckDB projects:")
-    if available_projects:
-        for path in available_projects:
-            print(f"- {path.stem}")
-    else:
-        print("- <none>")
-    schema_tool = DuckDBSchemaTool(tool)
-
-    llm = AzureOpenAIServerModel(
-        model_id=model_name,
-        azure_endpoint=azure_endpoint,
+    # Create Azure OpenAI client
+    client = AzureOpenAI(
         api_key=api_key,
         api_version=api_version,
+        azure_endpoint=azure_endpoint
     )
 
     if os.environ.get("AZURE_OPENAI_SKIP_CHECK", "").strip().lower() not in BOOL_TRUE:
-        _validate_azure_openai_connection(llm, azure_endpoint)
-
-    diagram_tool = DuckDBDiagramTool(tool)
-    ui_tool = DuckDBLaunchUITool(tool, default_executable=duckdb_executable_path)
+        _validate_azure_openai_connection(client, azure_endpoint)
 
     system_prompt = (
-        "You are the DBDocumenter assistant. Restrict every response to the DuckDB schemas, tables, and data "
-        "available through this project. When a user asks about unrelated topics, politely redirect them toward "
-        "questions about the documented datasets or available queries. When a user requests an ER diagram, "
-        "ask for their preferred image filename (fill out extension if not provided) and call the duckdb_diagram tool "
-        "with thatimage_path. "
-        "Only return a text-only summary without exporting an image if the user explicitly opts out of image "
-        "generation. "
-        "When you need schema details, call the 'duckdb_schema' tool (actions: list_tables, list_fields, get_schema) "
-        "instead of assuming the schema is already in context. When a user wants to open the DuckDB graphical "
-        "interface or browse the database visually, launch the 'duckdb_ui' tool (provide the project name when "
-        "multiple databases exist). "
-        "All fields that exist in the documented schema are considered documented if the have any description. "
-        "Check the tables in the DB for fields that are missing documentation and offer to document them when asked. "
-        "Be careful with the data in the schema json, do not delete useful information. "
-        "When asked to show data select a few important columns (3-4) and limit the number of rows to 10, "
-        "except if asked explicity for specific columns or number of rows. "
-        "The DB you quering is duckdb, so use duckdb specific syntax. "
-        "When a query fails show the query to the user and continue to try to fix it. "
+        "You are the DBDocumenter assistant for working with DuckDB databases. "
+        "Focus your responses on the DuckDB schemas, tables, and data available in this project. "
+        "If a user asks about unrelated topics, redirect them to questions about the documented datasets. "
+        "\n\n"
+        "CRITICAL: ALWAYS CHECK SCHEMA BEFORE WRITING SQL\n"
+        "Before executing ANY SQL query, you MUST:\n"
+        "1. Use duckdb_schema tool with action='list_tables' to see available tables\n"
+        "2. If you need column information, use duckdb_schema with action='list_fields' and table_name parameter\n"
+        "3. Only then write the SQL query using the EXACT table and column names from the schema\n"
+        "4. NEVER guess table or column names - always verify them first using the schema tool\n"
+        "\n"
+        "This prevents errors like querying non-existent tables. "
+        "The schema tool is fast and should be used liberally.\n"
+        "\n\n"
+        "CHART VISUALIZATION:\n"
+        "When a user requests a CHART, GRAPH, or VISUALIZATION (e.g., 'show bar chart', 'create a line graph'):\n"
+        "1. Use the duckdb_chart tool instead of duckdb_query\n"
+        "2. Specify the chart_type: 'bar', 'line', 'pie', 'scatter', or 'area'\n"
+        "3. Write SQL that returns data suitable for charting:\n"
+        "   - First column: labels/categories (x-axis)\n"
+        "   - Remaining columns: numeric values (y-axis/series)\n"
+        "4. The tool will return chart data as JSON\n"
+        "5. In your response, include the COMPLETE chart JSON (do not remove the 'sql' field) "
+        "in a ```chart code block\n"
+        "6. Explain what the chart shows after the chart block\n"
+        "\n"
+        "Example: User asks 'orders per year and month in bar chart'\n"
+        "Use: duckdb_chart(sql='SELECT YEAR(date), MONTH(date), COUNT(*) FROM orders GROUP BY 1,2', "
+        "chart_type='bar', title='Orders by Month')\n"
+        "Then in your response:\n"
+        "```chart\n"
+        "{...chart JSON from tool...}\n"
+        "```\n"
+        "This chart shows the distribution of orders across years and months.\n"
+        "\n\n"
+        "CRITICAL FORMATTING RULE:\n"
+        "Every time you execute a SQL query using duckdb_query for DATA queries, you MUST:\n"
+        "1. BEFORE calling the tool, briefly explain your reasoning (1-2 sentences)\n"
+        "2. Call the tool with the 'plan' parameter containing a detailed implementation plan that includes:\n"
+        "   - Which table(s) you selected and why\n"
+        "   - What columns or aggregations you're using\n"
+        "   - Any JOINs, filters (WHERE), or groupings and the reasoning behind them\n"
+        "   - Why you chose this approach (e.g., performance, data accuracy)\n"
+        "3. Include the SQL query in a ```sql code block in your response\n"
+        "4. Show the results below the SQL block\n"
+        "This is MANDATORY for all data queries. Metadata queries don't need detailed plans.\n"
+        "\n\n"
+        "WORKFLOW FOR DATA QUERIES:\n"
+        "When a user asks about data (not just metadata), follow these steps:\n"
+        "1. FIRST: Use duckdb_schema to check what tables exist and their columns\n"
+        "2. THEN: Use the duckdb_query tool to execute a SQL query against the database\n"
+        "3. Add a LIMIT clause (default LIMIT 10) ONLY for queries that return multiple rows\n"
+        "   (e.g., SELECT * FROM table)\n"
+        "   - DO NOT add LIMIT for aggregation queries (COUNT, SUM, AVG, MAX, MIN, GROUP BY, etc.)\n"
+        "   - Aggregations already return a small result set\n"
+        "4. In your response, FIRST show the SQL in a ```sql code block\n"
+        "5. THEN show the results\n"
+        "6. For multi-row results, format as a markdown table using pipe separators (|)\n"
+        "   - Include header row with column names\n"
+        "   - Include separator row with dashes (---)\n"
+        "   - Each data row should use pipes to separate columns\n"
+        "   - Example: | column1 | column2 |\\n| --- | --- |\\n| value1 | value2 |\n"
+        "7. For single-value results (one row, one column), you may present as plain text\n"
+        "\n"
+        "Example workflows:\n"
+        "User asks: 'Show me the delivery methods'\n"
+        "Your response MUST be:\n"
+        "```sql\n"
+        "SELECT * FROM delivery_methods LIMIT 10\n"
+        "```\n"
+        "| id | name | description |\n"
+        "| --- | --- | --- |\n"
+        "| 1 | Pickup | Customer pickup |\n"
+        "| 2 | Delivery | Home delivery |\n"
+        "\n"
+        "User asks: 'How many orders?'\n"
+        "Step 1: Check schema for tables containing 'order'\n"
+        "Step 2: Write SQL using the correct table name\n"
+        "Your response MUST be:\n"
+        "```sql\n"
+        "SELECT COUNT(*) FROM orders\n"
+        "```\n"
+        "117381\n"
+        "\n"
+        "User asks: 'Orders per status?'\n"
+        "Your response MUST be:\n"
+        "```sql\n"
+        "SELECT status, COUNT(*) as order_count FROM orders GROUP BY status\n"
+        "```\n"
+        "| status | order_count |\n"
+        "| --- | --- |\n"
+        "| 0 | 12295 |\n"
+        "| 8 | 101937 |\n"
+        "\n"
+        "NEVER just show the result without the SQL. Always show both.\n"
+        "\n\n"
+        "DATABASE CONTEXT:\n"
+        "- The active project and database are already selected for you\n"
+        "- When calling duckdb_query, you do NOT need to specify the 'database' or 'project' parameters\n"
+        "- The tool will automatically use the currently active database\n"
+        "- Simply call: duckdb_query(sql='your query here')\n"
+        "\n\n"
+        "OTHER GUIDELINES:\n"
+        "- For schema details, use the duckdb_schema tool with actions: list_tables, list_fields, or get_schema\n"
+        "- When showing data, select 3-4 important columns unless the user specifies otherwise\n"
+        "- Use DuckDB-specific syntax for queries\n"
+        "- If a query fails, show the query to the user and attempt to fix it\n"
+        "- Write SQL and results directly in your answer as markdown, not as Python code or print statements\n"
     )
 
-    agent = SchemaAwareCodeAgent(
+    agent = DirectOpenAIAgent(
+        client=client,
+        model=model_name,
+        query_tool=tool,
         schema_tool=schema_tool,
-        tools=[tool, schema_tool, diagram_tool, ui_tool],
-        model=llm,
-        max_steps=max_steps,
-        additional_authorized_imports=["duckdb"],
+        chart_tool=chart_tool,
         system_prompt=system_prompt,
+        max_iterations=max_steps,
     )
+
+    # Store tool references for backward compatibility
     agent.duckdb_tool = tool  # type: ignore[attr-defined]
     agent.duckdb_schema_tool = schema_tool  # type: ignore[attr-defined]
-    agent.duckdb_diagram_tool = diagram_tool  # type: ignore[attr-defined]
-    agent.duckdb_ui_tool = ui_tool  # type: ignore[attr-defined]
+    agent.duckdb_chart_tool = chart_tool  # type: ignore[attr-defined]
+
     return agent
 
 
-def _validate_azure_openai_connection(model: AzureOpenAIServerModel, endpoint: str) -> None:
+def _validate_azure_openai_connection(client: AzureOpenAI, endpoint: str) -> None:
     """Ensure the Azure OpenAI credentials are valid before returning the agent."""
     try:
-        client = model.create_client()
+        # Simple test - list models to verify connection
+        client.models.list()
     except Exception as exc:  # pragma: no cover - depends on environment configuration
         raise RuntimeError(
-            "Failed to create Azure OpenAI client. Check AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and "
+            "Azure OpenAI connectivity test failed. Check AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and "
             "AZURE_OPENAI_API_VERSION. "
             f"Endpoint attempted: {endpoint}. "
             f"Details: {exc}"
         ) from exc
-
-    errors: list[Exception] = []
-
-    if hasattr(client, "models") and hasattr(client.models, "list"):
-        try:
-            client.models.list()
-            return
-        except Exception as exc:  # pragma: no cover - depends on service
-            errors.append(exc)
-
-    last_error = errors[-1] if errors else None
-    detail = f" Details: {last_error}" if last_error else ""
-    raise RuntimeError(
-        "Azure OpenAI connectivity test failed. Ensure the deployment name, endpoint, and API version are correct "
-        f"and that the resource is reachable. Endpoint attempted: {endpoint}.{detail}"
-    ) from last_error
 
 
 def run_agent(prompt: str, **agent_kwargs) -> str:

@@ -11,9 +11,15 @@ from typing import Dict, List, Mapping
 from dotenv import load_dotenv
 
 if __package__:
-    from .synapse_to_duckdb import SynapseConnectionConfig, copy_synapse_objects_to_duckdb
+    from .synapse_to_duckdb import (
+        SynapseConnectionConfig,
+        copy_synapse_objects_to_duckdb,
+    )
 else:  # pragma: no cover - script entry compatibility
-    from synapse_to_duckdb import SynapseConnectionConfig, copy_synapse_objects_to_duckdb
+    from synapse_to_duckdb import (
+        SynapseConnectionConfig,
+        copy_synapse_objects_to_duckdb,
+    )
 
 BOOL_TRUE = {"1", "true", "yes", "on"}
 
@@ -53,15 +59,47 @@ def parse_extra_params(raw: str) -> Mapping[str, str]:
     return params
 
 
+def _parse_view_entry(raw: str, index: int) -> Mapping[str, object]:
+    entry = raw.strip()
+    if not entry:
+        raise RuntimeError(f"SYNAPSE_VIEWS entry #{index} is empty.")
+
+    if ":" not in entry:
+        return {"view": entry}
+
+    parts = entry.split(":", 2)
+    name_part = parts[0].strip()
+    limit_part = parts[1].strip() if len(parts) > 1 else ""
+    order_part = parts[2].strip() if len(parts) > 2 else ""
+    if not name_part:
+        raise RuntimeError(f"SYNAPSE_VIEWS entry #{index} is missing a view name.")
+
+    parsed: Dict[str, object] = {"view": name_part}
+
+    if limit_part and limit_part.lower() != "all":
+        try:
+            limit_value = int(limit_part)
+        except ValueError as exc:
+            raise RuntimeError(f"SYNAPSE_VIEWS entry #{index} has an invalid limit value '{limit_part}'.") from exc
+        if limit_value <= 0:
+            raise RuntimeError(f"SYNAPSE_VIEWS entry #{index} must specify a positive limit (received {limit_value}).")
+        parsed["limit"] = limit_value
+
+    if order_part:
+        parsed["order_by"] = order_part
+
+    return parsed
+
+
 def gather_objects() -> List[Mapping[str, object]]:
     objects: List[Mapping[str, object]] = []
 
     views_env = os.environ.get("SYNAPSE_VIEWS", "")
     if views_env:
-        for view in views_env.split(","):
+        for idx, view in enumerate(views_env.split(","), start=1):
             cleaned = view.strip()
             if cleaned:
-                objects.append({"view": cleaned})
+                objects.append(_parse_view_entry(cleaned, idx))
 
     queries_json = os.environ.get("SYNAPSE_QUERIES_JSON", "").strip()
     if queries_json:

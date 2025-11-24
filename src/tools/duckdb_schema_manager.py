@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
-from typing import Iterable, List, Optional, Set
+from typing import Any, Iterable, List, Optional, Set
+from uuid import uuid4
 
 
 class SchemaManager:
@@ -12,7 +12,7 @@ class SchemaManager:
     def __init__(self) -> None:
         self.project_path: Optional[Path] = None
         self.schema_path: Optional[Path] = None
-        self.schema: dict[str, object] = {}
+        self.schema: dict[str, Any] = {}
 
     def set_database(self, db_path: Path) -> None:
         self.project_path = db_path.resolve()
@@ -27,9 +27,34 @@ class SchemaManager:
             self.schema = self._empty_schema()
             self._save()
 
-    def _empty_schema(self) -> dict[str, object]:
+        # Ensure modern metadata fields exist
+        project_id = self.project_path.stem if self.project_path else "unknown_project"
+        display_name = self.schema.get("project_display_name")
+        if not isinstance(display_name, str) or not display_name.strip():
+            self.schema["project_display_name"] = self.schema.get("project") or project_id
+        if "project_description" not in self.schema or not isinstance(self.schema["project_description"], str):
+            self.schema["project_description"] = ""
+        if "project" not in self.schema or not isinstance(self.schema["project"], str):
+            self.schema["project"] = project_id
+        if "version" not in self.schema or not isinstance(self.schema["version"], str):
+            self.schema["version"] = "1.0.0"
+        if not isinstance(self.schema.get("diagrams"), list):
+            self.schema["diagrams"] = []
+        if not isinstance(self.schema.get("queries"), list):
+            self.schema["queries"] = []
+        self._save()
+
+    def _empty_schema(self) -> dict[str, Any]:
         project = self.project_path.stem if self.project_path else "unknown_project"
-        return {"project": project, "project_description": "", "tables": {}}
+        return {
+            "project": project,
+            "project_display_name": project,
+            "project_description": "",
+            "version": "1.0.0",
+            "tables": {},
+            "diagrams": [],
+            "queries": [],
+        }
 
     def _save(self) -> None:
         if not self.schema_path:
@@ -45,6 +70,42 @@ class SchemaManager:
     def list_tables(self) -> List[str]:
         tables = self.schema.get("tables", {})
         return sorted(tables.keys())
+
+    def get_project_metadata(self) -> dict[str, str]:
+        display_name = str(self.schema.get("project_display_name") or self.schema.get("project") or "")
+        description = str(self.schema.get("project_description") or "")
+        version = str(self.schema.get("version") or "1.0.0")
+        return {
+            "display_name": display_name,
+            "description": description,
+            "version": version,
+        }
+
+    def set_project_metadata(
+        self,
+        *,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+        version: Optional[str] = None,
+    ) -> dict[str, str]:
+        changed = False
+        if display_name is not None:
+            cleaned = display_name.strip()
+            if cleaned != self.schema.get("project_display_name"):
+                self.schema["project_display_name"] = cleaned
+                self.schema["project"] = cleaned
+                changed = True
+        if description is not None:
+            if description != self.schema.get("project_description"):
+                self.schema["project_description"] = description
+                changed = True
+        if version is not None:
+            if version != self.schema.get("version"):
+                self.schema["version"] = version
+                changed = True
+        if changed:
+            self._save()
+        return self.get_project_metadata()
 
     def list_fields(self, table: Optional[str] = None) -> dict[str, List[str]]:
         tables = self.schema.get("tables", {})
@@ -70,12 +131,177 @@ class SchemaManager:
         self.schema["project_description"] = description
         self._save()
 
+    # Diagram persistence ------------------------------------------------
+    def _ensure_diagram_section(self) -> list[dict[str, Any]]:
+        diagrams = self.schema.get("diagrams")
+        if not isinstance(diagrams, list):
+            diagrams = []
+        self.schema["diagrams"] = diagrams
+        return diagrams
+
+    def list_diagrams(self) -> list[dict[str, Any]]:
+        diagrams = self.schema.get("diagrams")
+        if isinstance(diagrams, list):
+            return diagrams
+        return []
+
+    def save_diagram(
+        self,
+        *,
+        name: str,
+        description: str | None,
+        tables: list[dict[str, Any]] | None,
+        diagram_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_diagram_section()
+        target_id = diagram_id or uuid4().hex
+        cleaned_name = name.strip() or "Untitled diagram"
+        cleaned_description = (description or "").strip()
+        stored_tables: list[dict[str, float | str]] = []
+        for entry in tables or []:
+            if not isinstance(entry, dict):
+                continue
+            raw_name = str(entry.get("name") or "").strip()
+            if not raw_name:
+                continue
+            try:
+                x = float(entry.get("x", 0))
+                y = float(entry.get("y", 0))
+            except (TypeError, ValueError):
+                continue
+            stored_tables.append({"name": raw_name, "x": x, "y": y})
+
+        diagram_record = {
+            "id": target_id,
+            "name": cleaned_name,
+            "description": cleaned_description,
+            "tables": stored_tables,
+        }
+        diagrams = self.schema["diagrams"]
+        assert isinstance(diagrams, list)
+        if diagram_id:
+            replaced = False
+            for index, existing in enumerate(diagrams):
+                if existing.get("id") == diagram_id:
+                    diagrams[index] = diagram_record
+                    replaced = True
+                    break
+            if not replaced:
+                diagrams.append(diagram_record)
+        else:
+            diagrams.append(diagram_record)
+        self._save()
+        return diagram_record
+
+    def delete_diagram(self, diagram_id: str) -> bool:
+        diagrams = self.schema.get("diagrams")
+        if not isinstance(diagrams, list):
+            return False
+        initial_count = len(diagrams)
+        self.schema["diagrams"] = [diagram for diagram in diagrams if diagram.get("id") != diagram_id]
+        if len(self.schema["diagrams"]) != initial_count:
+            self._save()
+            return True
+        return False
+
+    def get_diagram(self, diagram_id: str) -> dict[str, Any] | None:
+        diagrams = self.schema.get("diagrams")
+        if not isinstance(diagrams, list):
+            return None
+        for diagram in diagrams:
+            if diagram.get("id") == diagram_id:
+                return diagram
+        return None
+
+    # Query persistence -------------------------------------------------
+    def _ensure_query_section(self) -> list[dict[str, Any]]:
+        queries = self.schema.get("queries")
+        if not isinstance(queries, list):
+            queries = []
+        self.schema["queries"] = queries
+        return queries
+
+    def list_queries(self) -> list[dict[str, Any]]:
+        queries = self.schema.get("queries")
+        if isinstance(queries, list):
+            return queries
+        return []
+
+    def save_query(
+        self,
+        *,
+        name: str,
+        description: str | None,
+        sql: str,
+        limit: int | None = None,
+        query_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_query_section()
+        cleaned_sql = (sql or "").strip()
+        if not cleaned_sql:
+            raise ValueError("SQL text cannot be empty.")
+        target_id = query_id or uuid4().hex
+        cleaned_name = name.strip() or "Untitled query"
+        cleaned_description = (description or "").strip()
+        limit_value: int | None = None
+        if isinstance(limit, (int, float)):
+            try:
+                normalized = int(limit)
+            except (TypeError, ValueError):
+                normalized = None
+            if normalized and normalized > 0:
+                limit_value = normalized
+
+        record: dict[str, Any] = {
+            "id": target_id,
+            "name": cleaned_name,
+            "description": cleaned_description,
+            "sql": cleaned_sql,
+            "limit": limit_value,
+        }
+
+        queries = self.schema["queries"]
+        assert isinstance(queries, list)
+        if query_id:
+            replaced = False
+            for index, existing in enumerate(queries):
+                if existing.get("id") == query_id:
+                    queries[index] = record
+                    replaced = True
+                    break
+            if not replaced:
+                queries.append(record)
+        else:
+            queries.append(record)
+        self._save()
+        return record
+
+    def delete_query(self, query_id: str) -> bool:
+        queries = self.schema.get("queries")
+        if not isinstance(queries, list):
+            return False
+        initial_count = len(queries)
+        self.schema["queries"] = [query for query in queries if query.get("id") != query_id]
+        if len(self.schema["queries"]) != initial_count:
+            self._save()
+            return True
+        return False
+
+    def get_query(self, query_id: str) -> dict[str, Any] | None:
+        queries = self.schema.get("queries")
+        if not isinstance(queries, list):
+            return None
+        for query in queries:
+            if query.get("id") == query_id:
+                return query
+        return None
+
     def update_table(
         self,
         table: str,
         short_description: Optional[str] = None,
         long_description: Optional[str] = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         record = self._ensure_table(table)
         if short_description is not None:
             record["short_description"] = short_description
@@ -83,6 +309,14 @@ class SchemaManager:
             record["long_description"] = long_description
         self._save()
         return record
+
+    def delete_table(self, table: str) -> bool:
+        tables = self.schema.get("tables", {})
+        if table not in tables:
+            return False
+        del tables[table]
+        self._save()
+        return True
 
     def update_field(
         self,
@@ -94,7 +328,7 @@ class SchemaManager:
         nullability: Optional[str] = None,
         data_type: Optional[str] = None,
         values: Optional[dict[str, str]] = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         table_record = self._ensure_table(table)
         fields = table_record.setdefault("fields", {})
         field_record = fields.setdefault(
@@ -120,6 +354,47 @@ class SchemaManager:
         self._save()
         return field_record
 
+    def rename_field(self, table: str, old_name: str, new_name: str) -> dict[str, Any]:
+        if not new_name or new_name == old_name:
+            return self.get_field(table, old_name) or {}
+
+        table_record = self._ensure_table(table)
+        fields = table_record.setdefault("fields", {})
+        if old_name not in fields and old_name.lower() not in (name.lower() for name in fields):
+            raise ValueError(f"Field '{old_name}' not found in table '{table}'.")
+
+        # Resolve actual key respecting case
+        actual_old = None
+        for key in fields.keys():
+            if key == old_name or key.lower() == old_name.lower():
+                actual_old = key
+                break
+
+        if actual_old is None:
+            raise ValueError(f"Field '{old_name}' not found in table '{table}'.")
+
+        metadata = fields.pop(actual_old)
+        fields[new_name] = metadata
+
+        # Update relationships defined on this table
+        relationships = table_record.get("relationships") or []
+        for rel in relationships:
+            if rel.get("field") == actual_old:
+                rel["field"] = new_name
+
+        # Update relationships in other tables referencing this field
+        for table_name, other_table in (self.schema.get("tables") or {}).items():
+            rels = other_table.get("relationships") or []
+            for rel in rels:
+                if (
+                    rel.get("related_table") == table
+                    and rel.get("related_field") == actual_old
+                ):
+                    rel["related_field"] = new_name
+
+        self._save()
+        return metadata
+
     def add_relationship(
         self,
         table: str,
@@ -127,8 +402,7 @@ class SchemaManager:
         related_table: str,
         related_field: str,
         relationship_type: Optional[str] = None,
-        description: Optional[str] = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         table_record = self._ensure_table(table)
         relationships = table_record.setdefault("relationships", [])
         rel = {
@@ -136,11 +410,32 @@ class SchemaManager:
             "related_table": related_table,
             "related_field": related_field,
             "type": relationship_type or "unspecified",
-            "description": description or "",
         }
         relationships.append(rel)
         self._save()
         return rel
+
+    def set_relationships(self, table: str, relationships: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        record = self._ensure_table(table)
+        normalised: list[dict[str, Any]] = []
+        for rel in relationships:
+            field = (rel.get("field") or rel.get("column") or "").strip()
+            related_table = (rel.get("related_table") or rel.get("table") or "").strip()
+            rel_field = (rel.get("related_field") or rel.get("column_name") or "").strip()
+            rel_type = rel.get("relationship_type") or rel.get("type") or ""
+            if not field or not related_table or not rel_field:
+                continue
+            normalised.append(
+                {
+                    "field": field,
+                    "related_table": related_table,
+                    "related_field": rel_field,
+                    "type": rel_type or "unspecified",
+                }
+            )
+        record["relationships"] = normalised
+        self._save()
+        return normalised
 
     def describe_tables(self, table_names: Iterable[str]) -> str:
         tables = self.schema.get("tables", {})
@@ -200,7 +495,7 @@ class SchemaManager:
         return "\n".join(lines)
 
     # Internal helpers --------------------------------------------------
-    def _ensure_table(self, table: str) -> dict[str, object]:
+    def _ensure_table(self, table: str) -> dict[str, Any]:
         if "tables" not in self.schema:
             self.schema["tables"] = {}
         tables = self.schema["tables"]
@@ -239,7 +534,7 @@ class SchemaManager:
                 return value
         return None
 
-    def fields_needing_input(self, table: Optional[str] = None) -> list[dict[str, object]]:
+    def fields_needing_input(self, table: Optional[str] = None) -> list[dict[str, Any]]:
         tables = self.schema.get("tables", {})
         items: list[tuple[str, dict]] = []
         if table:
@@ -249,7 +544,7 @@ class SchemaManager:
         else:
             items.extend(tables.items())
 
-        pending: list[dict[str, object]] = []
+        pending: list[dict[str, Any]] = []
         for table_name, record in items:
             fields = record.get("fields", {})
             for field_name, metadata in fields.items():
@@ -315,8 +610,6 @@ class SchemaManager:
                 )
                 if rel.get("type"):
                     rel_desc += f"({rel['type']}) "
-                if rel.get("description"):
-                    rel_desc += f"- {rel['description']}"
                 lines.append(f"  - {rel_desc.strip()}")
         return "\n".join(lines)
 
@@ -392,7 +685,7 @@ class SchemaManager:
                 left = table_name
                 right = related_table
                 arrow = self._relationship_to_mermaid(rel)
-                lines.append(f"  {left} {arrow} {right} : {rel.get('description', '')}")
+                lines.append(f"  {left} {arrow} {right}")
 
         return "\n".join(lines)
 

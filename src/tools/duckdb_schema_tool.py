@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import json
-import re
 from typing import Optional
 
 from smolagents import Tool
 
-from .duckdb_schema_manager import SchemaManager
 from .duckdb_query_tool import DuckDBQueryTool
 
 __all__ = ["DuckDBSchemaTool"]
@@ -18,74 +15,26 @@ class DuckDBSchemaTool(Tool):
     name = "duckdb_schema"
     output_type = "string"
     description = (
-        "Reads or updates structured documentation about DuckDB projects, including table descriptions, "
-        "field metadata, allowed values, relationships, and structured summaries of documented tables/fields."
+        "Retrieves schema information about DuckDB tables, fields, relationships, and saved queries. "
+        "Use this tool to understand the database structure before writing SQL queries. "
+        "Available actions: list_tables, list_fields, get_table_info, list_saved_queries, get_full_schema."
     )
     inputs = {
         "action": {
             "type": "string",
-            "description": "Operation to perform: get_schema, list_tables, list_fields, set_project_description, "
-            "set_table, set_field, add_relationship, auto_document_table, list_pending_fields, summarize_table.",
+            "description": (
+                "Operation to perform: "
+                "list_tables (show all tables), "
+                "list_fields (show fields for a table), "
+                "get_table_info (detailed table info with fields and relationships), "
+                "list_saved_queries (show saved SQL queries), "
+                "get_full_schema (complete schema with all tables and fields)."
+            ),
             "nullable": False,
         },
-        "project": {
+        "table_name": {
             "type": "string",
-            "description": "Optional project name to switch to before applying the action.",
-            "nullable": True,
-        },
-        "table": {
-            "type": "string",
-            "description": "Target table name for table/field actions.",
-            "nullable": True,
-        },
-        "field": {
-            "type": "string",
-            "description": "Target field/column name for field actions.",
-            "nullable": True,
-        },
-        "short_description": {
-            "type": "string",
-            "description": "Short description text.",
-            "nullable": True,
-        },
-        "long_description": {
-            "type": "string",
-            "description": "Longer narrative description.",
-            "nullable": True,
-        },
-        "nullability": {
-            "type": "string",
-            "description": "Nullability information (e.g., nullable, not nullable).",
-            "nullable": True,
-        },
-        "data_type": {
-            "type": "string",
-            "description": "Data type of the field.",
-            "nullable": True,
-        },
-        "values_json": {
-            "type": "string",
-            "description": "JSON object mapping option values, e.g. {\"1\": \"B2B\"}.",
-            "nullable": True,
-        },
-        "relationship_type": {
-            "type": "string",
-            "description": "Relationship type (e.g. foreign_key, reference).",
-            "nullable": True,
-        },
-        "related_table": {
-            "type": "string",
-            "description": "Related table name when adding relationships.",
-            "nullable": True,
-        },
-        "related_field": {
-            "type": "string",
-            "description": "Related field name when adding relationships.",
-            "nullable": True,
-        },
-        "relationship_description": {
-            "type": "string",
-            "description": "Descriptive text for the relationship.",
+            "description": "Target table name for list_fields or get_table_info actions.",
             "nullable": True,
         },
     }
@@ -103,187 +52,190 @@ class DuckDBSchemaTool(Tool):
     def forward(
         self,
         action: Optional[str] = None,
-        project: Optional[str] = None,
-        table: Optional[str] = None,
-        field: Optional[str] = None,
-        short_description: Optional[str] = None,
-        long_description: Optional[str] = None,
-        nullability: Optional[str] = None,
-        data_type: Optional[str] = None,
-        values_json: Optional[str] = None,
-        relationship_type: Optional[str] = None,
-        related_table: Optional[str] = None,
-        related_field: Optional[str] = None,
-        relationship_description: Optional[str] = None,
+        table_name: Optional[str] = None,
     ) -> dict[str, str]:
         if not action:
             raise ValueError("Action is required.")
 
-        self._ensure_project_context(project)
+        self._ensure_project_context()
         manager = self.query_tool.schema_manager
 
         normalized_action = action.strip().lower()
-        if normalized_action == "get_schema":
-            return {"result": manager.get_schema_json()}
+
+        # List all tables with descriptions
         if normalized_action == "list_tables":
             tables = manager.list_tables()
             if not tables:
-                return {"result": "No tables have been documented yet."}
+                # Fallback to actual DuckDB tables if schema is empty
+                try:
+                    db_tables = self.query_tool.list_tables_in_database()
+                    if db_tables:
+                        lines = [f"- {table}" for table in db_tables]
+                        return {"result": "Available tables:\n" + "\n".join(lines)}
+                except Exception:
+                    pass
+                return {"result": "No tables found in database."}
+
             lines = []
-            for table_name in tables:
-                table_record = manager.get_table(table_name) or {}
-                field_count = len(table_record.get("fields") or {})
+            for table in tables:
+                table_record = manager.get_table(table) or {}
                 short_desc = table_record.get("short_description") or ""
-                details = [f"{field_count} field(s)"]
+                field_count = len(table_record.get("fields") or {})
                 if short_desc:
-                    details.insert(0, short_desc)
-                summary = " | ".join(details)
-                lines.append(f"- {table_name}: {summary}")
-            return {"result": "Documented tables:\n" + "\n".join(lines)}
-        if normalized_action in {"list_fields", "list_table_fields"}:
-            fields_map = manager.list_fields(table)
-            if table and not fields_map:
-                raise ValueError(f"Table '{table}' is not documented yet.")
-            if not fields_map:
-                return {"result": "No fields have been documented yet."}
-            lines = []
-            for table_name, fields in fields_map.items():
-                if fields:
-                    lines.append(f"- {table_name}: {', '.join(fields)}")
+                    lines.append(f"- {table}: {short_desc} ({field_count} documented fields)")
                 else:
-                    lines.append(f"- {table_name}: No fields documented yet.")
-            return {"result": "Documented fields:\n" + "\n".join(lines)}
-        if normalized_action == "set_project_description":
-            if not long_description and not short_description:
-                raise ValueError("Provide short_description or long_description to describe the project.")
-            description_parts = []
-            if short_description:
-                description_parts.append(short_description)
-            if long_description:
-                description_parts.append(long_description)
-            manager.set_project_description(" ".join(description_parts))
-            return {"result": "Project description updated."}
-        if normalized_action == "set_table":
-            if not table:
-                raise ValueError("Table name is required for set_table action.")
-            record = manager.update_table(table, short_description=short_description, long_description=long_description)
-            return {"result": f"Table '{table}' updated: {json.dumps(record, indent=2, ensure_ascii=False)}"}
-        if normalized_action == "set_field":
-            if not table or not field:
-                raise ValueError("Both table and field names are required for set_field action.")
-            values = self._parse_values(values_json) if values_json else None
-            record = manager.update_field(
-                table,
-                field,
-                short_description=short_description,
-                long_description=long_description,
-                nullability=nullability,
-                data_type=data_type,
-                values=values,
-            )
-            return {
-                "result": f"Field '{table}.{field}' updated: {json.dumps(record, indent=2, ensure_ascii=False)}"
-            }
-        if normalized_action == "add_relationship":
-            if not table or not field or not related_table or not related_field:
-                raise ValueError("Table, field, related_table, and related_field are required for add_relationship.")
-            record = manager.add_relationship(
-                table,
-                field,
-                related_table,
-                related_field,
-                relationship_type=relationship_type,
-                description=relationship_description,
-            )
-            return {
-                "result": "Relationship recorded: " + json.dumps(record, indent=2, ensure_ascii=False)
-            }
+                    lines.append(f"- {table} ({field_count} documented fields)")
+            return {"result": "Available tables:\n" + "\n".join(lines)}
 
-        if normalized_action == "auto_document_table":
-            if not table:
-                raise ValueError("Table name is required for auto_document_table action.")
-            columns = self.query_tool.fetch_table_schema(table)
-            if not columns:
-                return {"result": f"No columns found for table '{table}'. Ensure the table exists in DuckDB."}
+        # List fields for a specific table
+        if normalized_action == "list_fields":
+            if not table_name:
+                raise ValueError("table_name is required for list_fields action.")
 
-            manager.update_table(table, short_description=short_description, long_description=long_description)
-            updated_fields = 0
-            for column in columns:
-                column_name = column.get("name")
-                if not column_name:
-                    continue
-                existing = manager.get_field(table, column_name)
-                updates: dict[str, Optional[str]] = {}
-                column_type = column.get("type") or column.get("column_type")
-                if column_type and (not existing or not existing.get("data_type")):
-                    updates["data_type"] = column_type
-                notnull = column.get("notnull")
-                if notnull is not None:
-                    nullability_value = "not nullable" if bool(notnull) else "nullable"
-                    if not existing or not existing.get("nullability"):
-                        updates["nullability"] = nullability_value
-                if not existing or not existing.get("short_description"):
-                    updates["short_description"] = self._generate_short_description(column_name)
-                if updates:
-                    manager.update_field(table, column_name, **updates)
-                    updated_fields += 1
+            # Try documented schema first
+            table_record = manager.get_table(table_name)
+            if table_record and table_record.get("fields"):
+                fields = table_record["fields"]
+                lines = []
+                for field_name, field_data in fields.items():
+                    data_type = field_data.get("data_type", "")
+                    short_desc = field_data.get("short_description", "")
+                    if short_desc:
+                        lines.append(f"- {field_name} ({data_type}): {short_desc}")
+                    else:
+                        lines.append(f"- {field_name} ({data_type})")
+                return {"result": f"Fields in {table_name}:\n" + "\n".join(lines)}
 
-            pending_text = manager.format_pending_fields(table)
-            summary = manager.format_table_summary(table)
-            message = f"Auto-documented {updated_fields} field(s) for table '{table}'."
-            if short_description or long_description:
-                message += " Table descriptions updated."
-            return {"result": f"{message}\n{pending_text}\n\n{summary}"}
+            # Fallback to actual DuckDB schema
+            try:
+                columns = self.query_tool.fetch_table_schema(table_name)
+                if columns:
+                    lines = [
+                        f"- {col.get('name')} ({col.get('type', col.get('column_type', 'unknown'))})"
+                        for col in columns
+                        if col.get('name')
+                    ]
+                    return {"result": f"Fields in {table_name}:\n" + "\n".join(lines)}
+            except Exception as e:
+                return {"result": f"Error fetching fields for {table_name}: {str(e)}"}
 
-        if normalized_action in {"list_pending_fields", "list_missing_fields"}:
-            result = manager.format_pending_fields(table)
-            return {"result": result}
+            return {"result": f"No fields found for table {table_name}."}
 
-        if normalized_action == "summarize_table":
-            if not table:
-                raise ValueError("Table name is required for summarize_table action.")
-            summary = manager.format_table_summary(table)
-            return {"result": summary}
+        # Get detailed table information with relationships
+        if normalized_action == "get_table_info":
+            if not table_name:
+                raise ValueError("table_name is required for get_table_info action.")
+
+            table_record = manager.get_table(table_name)
+            if not table_record:
+                # Try to get basic info from DuckDB
+                try:
+                    columns = self.query_tool.fetch_table_schema(table_name)
+                    if columns:
+                        lines = ["Table: " + table_name, "\nFields:"]
+                        for col in columns:
+                            col_name = col.get('name')
+                            col_type = col.get('type', col.get('column_type', 'unknown'))
+                            if col_name:
+                                lines.append(f"  - {col_name}: {col_type}")
+                        return {"result": "\n".join(lines)}
+                except Exception:
+                    pass
+                return {"result": f"Table {table_name} not found."}
+
+            result_lines = [f"Table: {table_name}"]
+            if table_record.get("short_description"):
+                result_lines.append(f"Description: {table_record['short_description']}")
+            if table_record.get("long_description"):
+                result_lines.append(f"Details: {table_record['long_description']}")
+
+            fields = table_record.get("fields", {})
+            if fields:
+                result_lines.append("\nFields:")
+                for field_name, field_data in fields.items():
+                    data_type = field_data.get("data_type", "")
+                    desc = field_data.get("short_description", "")
+                    nullability = field_data.get("nullability", "")
+                    field_line = f"  - {field_name}"
+                    if data_type:
+                        field_line += f" ({data_type})"
+                    if nullability:
+                        field_line += f" [{nullability}]"
+                    if desc:
+                        field_line += f": {desc}"
+                    result_lines.append(field_line)
+
+            relationships = table_record.get("relationships", [])
+            if relationships:
+                result_lines.append("\nRelationships:")
+                for rel in relationships:
+                    field = rel.get("field")
+                    related_table = rel.get("related_table")
+                    related_field = rel.get("related_field")
+                    rel_type = rel.get("type", "reference")
+                    result_lines.append(
+                        f"  - {field} -> {related_table}.{related_field} ({rel_type})"
+                    )
+
+            return {"result": "\n".join(result_lines)}
+
+        # List saved queries
+        if normalized_action == "list_saved_queries":
+            queries = manager.list_queries()
+            if not queries:
+                return {"result": "No saved queries found."}
+
+            lines = ["Saved queries:"]
+            for query in queries:
+                name = query.get("name", "Untitled")
+                description = query.get("description", "")
+                sql = query.get("sql", "")
+                if description:
+                    lines.append(f"\n- {name}: {description}")
+                else:
+                    lines.append(f"\n- {name}")
+                if sql:
+                    # Show first 100 chars of SQL
+                    sql_preview = sql[:100] + "..." if len(sql) > 100 else sql
+                    lines.append(f"  SQL: {sql_preview}")
+            return {"result": "\n".join(lines)}
+
+        # Get full schema summary
+        if normalized_action == "get_full_schema":
+            tables = manager.list_tables()
+            if not tables:
+                return {"result": "No schema information available."}
+
+            lines = ["Database Schema Summary:\n"]
+            for table in tables:
+                table_record = manager.get_table(table) or {}
+                short_desc = table_record.get("short_description", "")
+                fields = table_record.get("fields", {})
+
+                lines.append(f"\nTable: {table}")
+                if short_desc:
+                    lines.append(f"  Description: {short_desc}")
+                lines.append(f"  Fields ({len(fields)}):")
+                for field_name, field_data in fields.items():
+                    data_type = field_data.get("data_type", "")
+                    lines.append(f"    - {field_name} ({data_type})")
+
+            return {"result": "\n".join(lines)}
 
         raise ValueError(
-            "Unknown action. Supported actions: get_schema, list_tables, list_fields, set_project_description, set_table, set_field, "
-            "add_relationship, auto_document_table, list_pending_fields, summarize_table."
+            f"Unknown action '{action}'. Supported: list_tables, list_fields, "
+            "get_table_info, list_saved_queries, get_full_schema."
         )
 
-    def _ensure_project_context(self, project: Optional[str]) -> None:
-        if project:
-            available = self.query_tool._discover_databases()
-            target = self.query_tool._resolve_database(None, project, available)
-            self.query_tool.current_database = target
-            self.query_tool.schema_manager.set_database(target)
-            return
-
+    def _ensure_project_context(self) -> None:
         if not self.query_tool.current_database:
             available = self.query_tool._discover_databases()
             if not available:
-                raise RuntimeError("No DuckDB databases available to document.")
+                raise RuntimeError("No DuckDB databases available.")
             if len(available) > 1:
                 raise RuntimeError(
-                    "Multiple DuckDB projects detected. Specify the target project name when using schema actions."
+                    "Multiple DuckDB projects detected. "
+                    "The project should already be set from the UI."
                 )
             self.query_tool.current_database = available[0]
             self.query_tool.schema_manager.set_database(available[0])
-
-    @staticmethod
-    def _parse_values(values_json: str) -> dict[str, str]:
-        try:
-            parsed = json.loads(values_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError("values_json must be a valid JSON object.") from exc
-        if not isinstance(parsed, dict):
-            raise ValueError("values_json must decode to a JSON object mapping values to labels.")
-        return {str(key): str(value) for key, value in parsed.items()}
-
-    @staticmethod
-    def _generate_short_description(name: str) -> str:
-        cleaned = name.replace("_", " ").strip()
-        if not cleaned:
-            return "Field description pending."
-        words = re.split(r"\s+", cleaned)
-        title = " ".join(word.capitalize() for word in words if word)
-        return title or "Field description pending."

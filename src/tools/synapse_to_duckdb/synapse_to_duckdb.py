@@ -29,7 +29,7 @@ if TYPE_CHECKING:  # pragma: no cover - hints only
 __all__ = ["SynapseConnectionConfig", "copy_synapse_objects_to_duckdb"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SynapseConnectionConfig:
     """
     Encapsulates the information required to connect to an Azure Synapse SQL endpoint.
@@ -122,6 +122,8 @@ def copy_synapse_objects_to_duckdb(
           Defaults to the view name (minus schema) or ``result_{index}`` for queries.
         - ``params``: Either a mapping of parameter names to values (in placeholder order) or a sequence of positional
           values for parametrised queries using ``?`` placeholders.
+        - ``limit``: Optional positive integer restricting the number of rows copied from a view.
+        - ``order_by``: Optional ``ORDER BY`` clause applied when copying a view; typically used with ``limit``.
 
     Parameters
     ----------
@@ -194,12 +196,40 @@ def _copy_single_object(
         )
 
     if view_name:
-        query_text = f"SELECT * FROM {view_name}"
         default_destination = str(view_name).split(".")[-1]
+        limit_value = obj.get("limit")
+        order_by_value = obj.get("order_by")
+
+        limit_clause: Optional[int] = None
+        if limit_value is not None:
+            try:
+                limit_clause = int(cast(Any, limit_value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"'limit' for item #{index} must be an integer value.") from exc
+            if limit_clause <= 0:
+                raise ValueError(f"'limit' for item #{index} must be greater than zero (received {limit_clause}).")
+
+        order_by_clause: Optional[str] = None
+        if order_by_value is not None:
+            if not isinstance(order_by_value, str) or not order_by_value.strip():
+                raise ValueError(f"'order_by' for item #{index} must be a non-empty string if provided.")
+            order_by_clause = order_by_value.strip()
+
+        if limit_clause is not None:
+            query_text = f"SELECT TOP ({limit_clause}) * FROM {view_name}"
+        else:
+            query_text = f"SELECT * FROM {view_name}"
+
+        if order_by_clause:
+            query_text += f" ORDER BY {order_by_clause}"
     else:
         default_destination = f"result_{index}"
 
-    destination = str(obj.get("destination_table", default_destination))
+    raw_destination = obj.get("destination_table")
+    if raw_destination is None:
+        destination = default_destination
+    else:
+        destination = str(raw_destination).strip() or default_destination
     exists_already = _table_exists(destination, duck_conn)
 
     if exists_already and not overwrite_existing:
@@ -243,19 +273,40 @@ def _fetch_dataframe(
     params: Optional[tuple[Any, ...]],
     synapse_conn: "pyodbc.Connection",  # type: ignore
 ) -> "pd.DataFrame":  # type: ignore
+    if pd is None:
+        raise RuntimeError("pandas is unavailable while fetching data from Synapse.")
+
     cursor = synapse_conn.cursor()
     try:
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-
-        if cursor.description is None:
-            info_lines = [f"Query for item #{index} did not return a result set. Ensure it is a SELECT statement."]
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+        except Exception as exec_error:
+            info_lines = [f"Failed to execute query for item #{index}."]
+            info_lines.append(f"Error: {exec_error}")
             info_lines.append("Executed SQL:")
             info_lines.append(query.strip())
             if params:
                 info_lines.append(f"Parameters: {list(params)}")
+            info_lines.append("\nPossible causes:")
+            info_lines.append("- View/table does not exist in the database")
+            info_lines.append("- Insufficient permissions to access the object")
+            info_lines.append("- Invalid SQL syntax")
+            raise ValueError("\n".join(info_lines)) from exec_error
+
+        if cursor.description is None:
+            info_lines = [f"Query for item #{index} did not return a result set (cursor.description is None)."]
+            info_lines.append("This typically means:")
+            info_lines.append("- The view/table exists but has no column definitions")
+            info_lines.append("- The view is a stored procedure or non-SELECT object")
+            info_lines.append("- The query executed but returned no metadata")
+            info_lines.append("\nExecuted SQL:")
+            info_lines.append(query.strip())
+            if params:
+                info_lines.append(f"Parameters: {list(params)}")
+            info_lines.append(f"\nRow count returned: {cursor.rowcount}")
             raise ValueError(
                 "\n".join(info_lines)
             )
@@ -265,6 +316,7 @@ def _fetch_dataframe(
     finally:
         cursor.close()
 
+    assert pd is not None  # Satisfy type checkers; guarded above.
     return pd.DataFrame.from_records(rows, columns=columns)
 
 
@@ -318,6 +370,10 @@ def _strip_identifier(value: str) -> str:
 
 def _coerce_dataframe_types(df: "pd.DataFrame") -> "pd.DataFrame":  # type: ignore[valid-type]
     """Attempt to coerce object-typed columns to numerics when every value is parseable."""
+    if pd is None:
+        raise RuntimeError("pandas is required to coerce dataframe types.")
+
+    assert pd is not None  # Narrow for static analysis.
     result = df.copy()
     for column in result.columns:
         series = result[column]
