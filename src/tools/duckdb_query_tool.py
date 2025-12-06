@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
@@ -346,6 +347,22 @@ class DuckDBQueryTool(Tool):
     def _stringify(value: object) -> str:
         if value is None:
             return ""
+
+        if isinstance(value, (float, Decimal)):
+            val_float = float(value)
+            # If the number is very big (millions), no decimals
+            if abs(val_float) >= 1_000_000:
+                return f"{val_float:,.0f}"
+
+            # If it's effectively an integer, show as integer
+            if isinstance(value, float) and value.is_integer():
+                return f"{int(value)}"
+            if isinstance(value, Decimal) and value % 1 == 0:
+                return f"{int(value)}"
+
+            # Otherwise limit to 2 decimals
+            return f"{val_float:.2f}"
+
         return str(value)
 
     def _slugify(self, value: str) -> str:

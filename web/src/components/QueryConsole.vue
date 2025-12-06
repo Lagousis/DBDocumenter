@@ -1,7 +1,6 @@
 <template>
   <div class="query-console">
     <div class="toolbar">
-      <h2 class="section-title">{{ tab.title }}</h2>
       <div class="toolbar-actions">
         <div class="button-group">
           <button 

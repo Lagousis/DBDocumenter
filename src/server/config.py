@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+from dotenv import load_dotenv
+
+# Force load .env from project root to ensure we get the file
+# even if CWD is different
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+ENV_PATH = ROOT_DIR / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
 
 @dataclass(slots=True)
 class DatalakeConfig:
@@ -69,6 +77,8 @@ class ServerSettings:
     allowed_origins: List[str] = field(default_factory=list)
     query_default_limit: int = 200
     agent_max_steps: int = 8
+    agent_timeout: float = 180.0
+    agent_max_retries: int = 10
     datalakes: List[DatalakeConfig] = field(default_factory=list)
 
     @classmethod
@@ -96,6 +106,18 @@ class ServerSettings:
             agent_max_steps = int(max_steps_value) if max_steps_value else 8
         except ValueError:
             agent_max_steps = 8
+
+        timeout_value = os.environ.get("DBDOC_AGENT_TIMEOUT", "")
+        try:
+            agent_timeout = float(timeout_value) if timeout_value else 180.0
+        except ValueError:
+            agent_timeout = 180.0
+
+        retries_value = os.environ.get("DBDOC_AGENT_MAX_RETRIES", "")
+        try:
+            agent_max_retries = int(retries_value) if retries_value else 10
+        except ValueError:
+            agent_max_retries = 10
 
         # Load datalakes configuration from JSON environment variable
         datalakes: List[DatalakeConfig] = []
@@ -134,7 +156,9 @@ class ServerSettings:
             allowed_origins=origins,
             query_default_limit=query_default_limit,
             agent_max_steps=agent_max_steps,
-            datalakes=datalakes,
+            agent_timeout=agent_timeout,
+            agent_max_retries=agent_max_retries,
+            datalakes=datalakes
         )
 
 

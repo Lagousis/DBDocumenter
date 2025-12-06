@@ -96,11 +96,25 @@ export interface AutoDescribeRequest {
   current_short_description?: string | null;
   current_long_description?: string | null;
   data_type?: string | null;
-  description_type?: 'short' | 'long';
+  description_type?: 'short' | 'long' | 'data_type';
 }
 
 export interface AutoDescribeResponse {
   description: string;
+}
+
+export interface AIAssistFieldRequest {
+  project?: string;
+  database?: string;
+  table: string;
+  field: string;
+}
+
+export interface AIAssistFieldResponse {
+  short_description: string;
+  long_description: string;
+  data_type: string;
+  nullable: boolean;
 }
 
 export interface QueryRequest {
@@ -115,11 +129,15 @@ export interface ChatRequest {
   reset?: boolean;
   project?: string;
   database?: string;
+  file_content?: string;
+  filename?: string;
+  session_id?: string;
 }
 
 export interface ChatResponse {
   reply: string;
   database?: string | null;
+  session_id?: string;
   metadata?: {
     tools_used?: Array<{ name: string; arguments: any }>;
     total_tokens?: number;
@@ -130,6 +148,32 @@ export interface ChatResponse {
     iterations?: number;
     model?: string;
   };
+}
+
+export interface ChatMessage {
+  role: string;
+  content: string;
+}
+
+export interface ChatSessionSummary {
+  id: string;
+  project: string;
+  created_at: number;
+  description: string;
+  message_count: number;
+}
+
+export interface ChatSession {
+  id: string;
+  project: string;
+  created_at: number;
+  description: string;
+  messages: ChatMessage[];
+}
+
+export interface ChatHistorySaveRequest {
+  project: string;
+  messages: ChatMessage[];
 }
 
 export interface SchemaResponse {

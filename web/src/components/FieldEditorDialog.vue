@@ -20,28 +20,12 @@
             </label>
 
             <label class="block">
-              <div class="label-row">
-                <span class="label">Short description</span>
-                <button type="button" class="icon-button small" :disabled="generatingAI" title="Generate description with AI" @click="handleAutoDescribeShort">
-                  <svg v-if="!generatingAI" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2">
-                    <path d="M4 8.5h3.5L6 12.5l6-5h-3.5L10 3.5 4 8.5z" stroke-linejoin="round" />
-                  </svg>
-                  <span v-else class="spinner"></span>
-                </button>
-              </div>
+              <span class="label">Short description</span>
               <input v-model="form.short_description" type="text" :disabled="generatingAI" />
             </label>
 
             <label class="block">
-              <div class="label-row">
-                <span class="label">Long description</span>
-                <button type="button" class="icon-button small" :disabled="generatingAI" title="Generate description with AI" @click="handleAutoDescribe">
-                  <svg v-if="!generatingAI" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2">
-                    <path d="M4 8.5h3.5L6 12.5l6-5h-3.5L10 3.5 4 8.5z" stroke-linejoin="round" />
-                  </svg>
-                  <span v-else class="spinner"></span>
-                </button>
-              </div>
+              <span class="label">Long description</span>
               <textarea v-model="form.long_description" rows="4" :disabled="generatingAI" />
             </label>
 
@@ -158,6 +142,11 @@
         </div>
 
         <footer class="dialog-footer">
+          <button type="button" class="secondary-button ai-button" :disabled="generatingAI" @click="handleAIAssist">
+            <span>{{ generatingAI ? "Generating..." : "✨ AI Assist" }}</span>
+          </button>
+          <button type="button" class="secondary-button danger" :disabled="saving" @click="handleDelete">Delete from schema</button>
+          <div style="flex: 1;"></div>
           <button type="button" class="secondary-button" @click="handleClose">Cancel</button>
           <button type="button" class="secondary-button" :disabled="saving" @click="handleSave">
             {{ saving ? "Saving..." : "Save" }}
@@ -178,9 +167,9 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
 
-import { autoDescribeField, runQuery, updateFieldMetadata } from "../api/client";
+import { aiAssistField, deleteField, runQuery, updateFieldMetadata } from "../api/client";
 import { useSessionStore } from "../stores/session";
-import type { AutoDescribeRequest, FieldUpdateRequest, RelationshipPayload } from "../types/api";
+import type { AIAssistFieldRequest, FieldUpdateRequest, RelationshipPayload } from "../types/api";
 
 interface ValuePair {
   key: string;
@@ -436,71 +425,60 @@ async function handleSave() {
   }
 }
 
-async function handleAutoDescribe() {
+async function handleAIAssist() {
   if (!props.table || !props.field) {
     return;
   }
-  if (form.long_description && form.long_description.trim()) {
-    const confirmed = window.confirm("Replace the existing long description with an AI-generated one?");
-    if (!confirmed) {
-      return;
-    }
-  }
+  
   generatingAI.value = true;
   try {
-    const payload: AutoDescribeRequest = {
+    const payload: AIAssistFieldRequest = {
       project: sessionStore.activeProject,
       database: sessionStore.activeDatabase,
       table: props.table,
       field: form.field_name || props.field,
-      current_short_description: form.short_description,
-      current_long_description: form.long_description,
-      data_type: form.data_type,
-      description_type: 'long',
     };
-    const response = await autoDescribeField(payload);
-    if (response.description) {
-      form.long_description = response.description;
+    const response = await aiAssistField(payload);
+    
+    // Update all fields
+    if (response.short_description) {
+      form.short_description = response.short_description;
+    }
+    if (response.long_description) {
+      form.long_description = response.long_description;
+    }
+    if (response.data_type) {
+      form.data_type = response.data_type;
+    }
+    if (response.nullable !== undefined) {
+      form.allow_null = response.nullable;
     }
   } catch (error) {
-    console.error("Failed to generate AI description:", error);
-    alert("Failed to generate AI description. Please try again.");
+    console.error("Failed to generate AI assist:", error);
+    alert("Failed to generate AI assist. Please try again.");
   } finally {
     generatingAI.value = false;
   }
 }
 
-async function handleAutoDescribeShort() {
-  if (!props.table || !props.field) {
+async function handleDelete() {
+  if (!props.table || !props.field) return;
+  if (!window.confirm(`Are you sure you want to delete the field "${props.field}" from the schema documentation for table "${props.table}"? This will NOT remove the column from the database, only from the documentation.`)) {
     return;
   }
-  if (form.short_description && form.short_description.trim()) {
-    const confirmed = window.confirm("Replace the existing short description with an AI-generated one?");
-    if (!confirmed) {
-      return;
-    }
-  }
-  generatingAI.value = true;
+  saving.value = true;
   try {
-    const payload: AutoDescribeRequest = {
+    await deleteField(props.table, props.field, {
       project: sessionStore.activeProject,
       database: sessionStore.activeDatabase,
-      table: props.table,
-      field: form.field_name || props.field,
-      current_short_description: form.short_description,
-      current_long_description: form.long_description,
-      data_type: form.data_type,
-      description_type: 'short',
-    };
-    const response = await autoDescribeField(payload);
-    if (response.description) {
-      form.short_description = response.description;
-    }
+    });
+    emit("saved");
+    emit("close");
   } catch (error) {
-    console.error("Failed to generate AI description:", error);
-    alert("Failed to generate AI description. Please try again.");
+    console.error("Failed to delete field:", error);
+    alert("Failed to delete field. Please try again.");
   } finally {
-    generatingAI.value = false;
+    saving.value = false;
   }
 }
 
@@ -855,6 +833,43 @@ textarea {
   background-color: transparent;
   border-color: #d89b6c;
   color: #b26a45;
+}
+
+.secondary-button.danger {
+  color: #dc2626;
+  border-color: #fca5a5;
+}
+
+.secondary-button.danger:hover {
+  background-color: #dc2626;
+  border-color: #dc2626;
+  color: #ffffff;
+}
+
+.secondary-button.full-width {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+}
+
+.ai-button {
+  background-color: #f0f9ff;
+  border-color: #bae6fd;
+  color: #0284c7;
+}
+
+.ai-button:hover {
+  background-color: #0284c7;
+  border-color: #0284c7;
+  color: #ffffff;
+}
+
+.ai-button:disabled:hover {
+  background-color: #f0f9ff;
+  border-color: #bae6fd;
+  color: #0284c7;
 }
 
 .suggestion-chips {

@@ -75,11 +75,6 @@
     <div class="chart-container">
       <svg ref="chartSvg" class="chart-svg"></svg>
     </div>
-
-    <div v-if="tab.plan" class="chart-info">
-      <h3>Implementation Plan</h3>
-      <p>{{ tab.plan }}</p>
-    </div>
   </div>
 </template>
 
@@ -164,7 +159,7 @@ function renderChart(): void {
 
   const containerWidth = chartSvg.value.parentElement?.clientWidth ?? 800;
   const containerHeight = 500;
-  const margin = { top: 40, right: 120, bottom: 80, left: 80 };
+  const margin = { top: 40, right: 200, bottom: 80, left: 150 };
   const width = containerWidth - margin.left - margin.right;
   const height = containerHeight - margin.top - margin.bottom;
 
@@ -414,7 +409,7 @@ function renderHorizontalBarChart(g: d3.Selection<SVGGElement, unknown, null, un
     g.append("text")
       .attr("transform", "rotate(-90)")
       .attr("x", -height / 2)
-      .attr("y", -60)
+      .attr("y", -135)
       .attr("text-anchor", "middle")
       .style("font-size", "12px")
       .text(editableYLabel.value);

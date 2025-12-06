@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import ServerSettings
 from .models import (
+    AIAssistFieldRequest,
+    AIAssistFieldResponse,
     AutoDescribeRequest,
     AutoDescribeResponse,
+    ChatHistorySaveRequest,
     ChatRequest,
     ChatResponse,
+    ChatSession,
+    ChatSessionSummary,
     DatabaseStatsResponse,
     DatalakeAddRequest,
     DatalakeInfo,
@@ -217,6 +222,27 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             ) from exc
         return AutoDescribeResponse(description=description)
 
+    @app.post("/schema/field/ai-assist", response_model=AIAssistFieldResponse)
+    async def ai_assist_field(request: AIAssistFieldRequest) -> AIAssistFieldResponse:
+        try:
+            result = await runtime.ai_assist_field(
+                project=request.project,
+                database=request.database,
+                table=request.table,
+                field=request.field,
+            )
+            return result
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:
+            import traceback
+            error_detail = f"Failed to generate AI assist: {str(exc)}\n{traceback.format_exc()}"
+            print(error_detail)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"AI assist failed: {str(exc)}"
+            ) from exc
+
     @app.get("/diagrams", response_model=list[DiagramRecord])
     async def list_diagrams(project: Optional[str] = None, database: Optional[str] = None) -> list[DiagramRecord]:
         diagrams = await runtime.list_diagrams(project=project, database=database)
@@ -333,6 +359,9 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 reset=request.reset,
                 project=request.project,
                 database=request.database,
+                file_content=request.file_content,
+                filename=request.filename,
+                session_id=request.session_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -352,6 +381,9 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                     reset=request.reset,
                     project=request.project,
                     database=request.database,
+                    file_content=request.file_content,
+                    filename=request.filename,
+                    session_id=request.session_id,
                 ):
                     yield f"data: {json.dumps(chunk)}\n\n"
             except Exception as exc:
@@ -367,6 +399,29 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # Chat History endpoints ------------------------------------------------
+
+    @app.get("/chat/history", response_model=list[ChatSessionSummary])
+    async def list_chat_history(project: str) -> list[ChatSessionSummary]:
+        return runtime.chat_history_manager.list_sessions(project)
+
+    @app.get("/chat/history/{session_id}", response_model=ChatSession)
+    async def get_chat_session(session_id: str, project: str) -> ChatSession:
+        session = runtime.chat_history_manager.get_session(project, session_id)
+        if not session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found")
+        return session
+
+    @app.post("/chat/history", response_model=ChatSession)
+    async def save_chat_session(request: ChatHistorySaveRequest) -> ChatSession:
+        return runtime.chat_history_manager.save_session(request.project, request.messages)
+
+    @app.delete("/chat/history/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_chat_session(session_id: str, project: str) -> Response:
+        if not runtime.chat_history_manager.delete_session(project, session_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     # Datalake sync endpoints -----------------------------------------------
 
@@ -485,6 +540,44 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.delete("/schema/field/{table}/{field}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_field(
+        table: str,
+        field: str,
+        project: Optional[str] = None,
+        database: Optional[str] = None,
+    ) -> Response:
+        try:
+            await runtime.delete_field(project=project, database=database, table=table, field=field)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post("/schema/enrich")
+    async def enrich_table(
+        file: UploadFile = File(...),
+        table: str = Form(...),
+        project: Optional[str] = Form(None),
+        database: Optional[str] = Form(None),
+    ) -> dict:
+        try:
+            content = await file.read()
+            result = await runtime.enrich_table_from_file(
+                project=project,
+                database=database,
+                table=table,
+                filename=file.filename or "unknown",
+                file_content=content,
+            )
+            return result
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Enrichment failed: {str(exc)}"
+            ) from exc
 
     return app
 

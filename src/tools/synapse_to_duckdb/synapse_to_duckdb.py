@@ -278,23 +278,31 @@ def _fetch_dataframe(
 
     cursor = synapse_conn.cursor()
     try:
+        # Prevent "rows affected" messages from interfering with result sets
+        cursor.execute("SET NOCOUNT ON")
         try:
             if params:
                 cursor.execute(query, params)
             else:
                 cursor.execute(query)
-        except Exception as exec_error:
-            info_lines = [f"Failed to execute query for item #{index}."]
-            info_lines.append(f"Error: {exec_error}")
-            info_lines.append("Executed SQL:")
-            info_lines.append(query.strip())
-            if params:
-                info_lines.append(f"Parameters: {list(params)}")
-            info_lines.append("\nPossible causes:")
-            info_lines.append("- View/table does not exist in the database")
-            info_lines.append("- Insufficient permissions to access the object")
-            info_lines.append("- Invalid SQL syntax")
-            raise ValueError("\n".join(info_lines)) from exec_error
+        except Exception as e:
+            # Retry with ANSI_WARNINGS OFF if truncation error occurs
+            if "String or binary data would be truncated" in str(e):
+                try:
+                    cursor.execute("SET ANSI_WARNINGS OFF")
+                    if params:
+                        cursor.execute(query, params)
+                    else:
+                        cursor.execute(query)
+                except Exception as retry_e:
+                    _raise_execution_error(index, query, params, retry_e)
+            else:
+                _raise_execution_error(index, query, params, e)
+
+        # Skip past any non-result-set messages (e.g. from triggers or SET commands)
+        while cursor.description is None:
+            if not cursor.nextset():
+                break
 
         if cursor.description is None:
             info_lines = [f"Query for item #{index} did not return a result set (cursor.description is None)."]
@@ -318,6 +326,22 @@ def _fetch_dataframe(
 
     assert pd is not None  # Satisfy type checkers; guarded above.
     return pd.DataFrame.from_records(rows, columns=columns)
+
+
+def _raise_execution_error(
+    index: int, query: str, params: Optional[tuple[Any, ...]], error: Exception
+) -> None:
+    info_lines = [f"Failed to execute query for item #{index}."]
+    info_lines.append(f"Error: {error}")
+    info_lines.append("Executed SQL:")
+    info_lines.append(query.strip())
+    if params:
+        info_lines.append(f"Parameters: {list(params)}")
+    info_lines.append("\nPossible causes:")
+    info_lines.append("- View/table does not exist in the database")
+    info_lines.append("- Insufficient permissions to access the object")
+    info_lines.append("- Invalid SQL syntax")
+    raise ValueError("\n".join(info_lines)) from error
 
 
 def _quote_identifier(identifier: str) -> str:

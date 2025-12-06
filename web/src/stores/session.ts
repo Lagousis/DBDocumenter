@@ -2,14 +2,18 @@ import { defineStore } from "pinia";
 
 import {
     createProject as createProjectApi,
+    deleteChatSession,
     deleteDiagram as deleteDiagramApi,
     deleteQuery as deleteQueryApi,
+    fetchChatHistory,
+    fetchChatSession,
     fetchDiagrams,
     fetchProjects,
     fetchQueries,
     fetchSchema,
     fetchTables,
     runQuery,
+    saveChatSession,
     saveDiagram as saveDiagramApi,
     saveQuery as saveQueryApi,
     sendChatStream,
@@ -17,11 +21,12 @@ import {
 } from "../api/client";
 import type {
     ChatResponse,
+    ChatSessionSummary,
     DiagramRecord,
     DiagramTablePosition,
     ProjectInfo,
     QueryRecord,
-    QueryResponse,
+    QueryResponse
 } from "../types/api";
 
 interface ChatEntry {
@@ -193,6 +198,10 @@ export const useSessionStore = defineStore("session", {
     queries: [] as QueryRecord[],
     queriesLoading: false,
     queryError: "",
+    chatSessions: [] as ChatSessionSummary[],
+    chatSessionsLoading: false,
+    chatSessionsError: "",
+    currentSessionId: undefined as string | undefined,
   }),
   getters: {
     hasProjects(state): boolean {
@@ -291,6 +300,13 @@ export const useSessionStore = defineStore("session", {
       this.projectDialogOpen = false;
     },
     async selectProject(name: string | undefined): Promise<void> {
+      // Reset workspace state
+      this.workspaceTabs = [];
+      this.activeWorkspaceTabId = undefined;
+      this.queryTabCounter = 1;
+      this.diagramTabCounter = 1;
+      this.clearChatHistory();
+      
       if (!name) {
         this.activeProject = undefined;
         this.activeDatabase = undefined;
@@ -302,10 +318,12 @@ export const useSessionStore = defineStore("session", {
         this.queries = [];
         this.queryError = "";
         this.queriesLoading = false;
+        this.currentSessionId = undefined;
         this._synchroniseActiveProject(undefined);
         if (typeof window !== "undefined") {
           window.localStorage.removeItem(STORAGE_SELECTED_TABLE_KEY);
         }
+        this.ensureDefaultQueryTab();
         return;
       }
       const match = this.projects.find((item) => item.name === name);
@@ -314,11 +332,13 @@ export const useSessionStore = defineStore("session", {
       }
       this.activeProject = match.name;
       this.activeDatabase = match.path;
+      this.currentSessionId = undefined;
       this._synchroniseActiveProject(this.activeProject);
       await this.refreshMetadata();
       if (typeof window !== "undefined") {
         window.localStorage.removeItem(STORAGE_SELECTED_TABLE_KEY);
       }
+      this.ensureDefaultQueryTab();
     },
     async updateActiveProjectDetails(displayName: string, description: string, version: string): Promise<ProjectInfo> {
       const info = this.activeProjectInfo;
@@ -336,11 +356,20 @@ export const useSessionStore = defineStore("session", {
     },
     async createProjectEntry(name: string, description: string): Promise<ProjectInfo> {
       const created = await createProjectApi({ name, description });
+      
+      // Reset workspace state for the new project
+      this.workspaceTabs = [];
+      this.activeWorkspaceTabId = undefined;
+      this.queryTabCounter = 1;
+      this.diagramTabCounter = 1;
+      this.clearChatHistory();
+
       this._applyProjectUpdate({ ...created, is_active: created.is_active });
       this.activeProject = created.name;
       this.activeDatabase = created.path;
       this._synchroniseActiveProject(this.activeProject);
       await this.refreshMetadata();
+      this.ensureDefaultQueryTab();
       return created;
     },
     _applyProjectUpdate(updated: ProjectInfo): void {
@@ -438,9 +467,9 @@ export const useSessionStore = defineStore("session", {
       await this.loadDiagrams().catch(() => undefined);
       await this.loadQueries().catch(() => undefined);
     },
-    async sendMessage(message: string): Promise<ChatResponse> {
-      if (!message.trim()) {
-        throw new Error("Message cannot be empty.");
+    async sendMessage(message: string, file?: { name: string; content: string }): Promise<ChatResponse> {
+      if (!message.trim() && !file) {
+        throw new Error("Message or file is required.");
       }
       const userEntry: ChatEntry = {
         id: makeId(),
@@ -469,6 +498,9 @@ export const useSessionStore = defineStore("session", {
             message,
             project: this.activeProject,
             database: this.activeDatabase,
+            file_content: file?.content,
+            filename: file?.name,
+            session_id: this.currentSessionId,
           },
           (chunk: { 
             type: string; 
@@ -476,7 +508,8 @@ export const useSessionStore = defineStore("session", {
             reply?: string; 
             error?: string; 
             database?: string; 
-            metadata?: ChatResponse['metadata'] 
+            metadata?: ChatResponse['metadata'];
+            session_id?: string;
           }) => {
             if (chunk.type === "status" && chunk.message) {
               // Update the assistant message with status
@@ -486,9 +519,25 @@ export const useSessionStore = defineStore("session", {
               assistantEntry.text = chunk.reply;
               finalResponse.reply = chunk.reply;
               finalResponse.database = chunk.database;
+              if (chunk.session_id) {
+                this.currentSessionId = chunk.session_id;
+                finalResponse.session_id = chunk.session_id;
+              }
               // Store execution metadata
               if (chunk.metadata) {
                 assistantEntry.metadata = chunk.metadata;
+
+                // Check if schema was updated and refresh if needed
+                if (chunk.metadata.tools_used) {
+                  const hasSchemaUpdate = chunk.metadata.tools_used.some((tool: any) => 
+                    tool.name === "duckdb_schema" && 
+                    ["update_field", "update_table", "update_fields_batch", "update_field_description"].includes(tool.arguments?.action)
+                  );
+                  
+                  if (hasSchemaUpdate) {
+                    this.refreshMetadata();
+                  }
+                }
               }
             } else if (chunk.type === "error" && chunk.error) {
               // Show error
@@ -498,6 +547,9 @@ export const useSessionStore = defineStore("session", {
               // Final database update
               if (chunk.database) {
                 this.activeDatabase = chunk.database;
+              }
+              if (chunk.session_id) {
+                this.currentSessionId = chunk.session_id;
               }
             }
           }
@@ -517,6 +569,67 @@ export const useSessionStore = defineStore("session", {
     },
     clearChatHistory(): void {
       this.chatHistory = [];
+      this.currentSessionId = undefined;
+    },
+    async loadChatHistory(): Promise<void> {
+        if (!this.activeProject) return;
+        this.chatSessionsLoading = true;
+        this.chatSessionsError = "";
+        try {
+            this.chatSessions = await fetchChatHistory(this.activeProject);
+        } catch (error) {
+            this.chatSessionsError = error instanceof Error ? error.message : "Failed to load chat history";
+        } finally {
+            this.chatSessionsLoading = false;
+        }
+    },
+    async loadChatSession(sessionId: string): Promise<void> {
+        if (!this.activeProject) return;
+        try {
+            const session = await fetchChatSession(sessionId, this.activeProject);
+            // Convert ChatMessage[] to ChatEntry[]
+            this.chatHistory = session.messages
+                .filter(msg => msg.role === "user" || msg.role === "assistant")
+                .map(msg => ({
+                    id: makeId(),
+                    role: msg.role as "user" | "assistant",
+                    text: msg.content,
+                    timestamp: Date.now(), // We don't store per-message timestamp in backend yet
+                }));
+            this.currentSessionId = sessionId;
+        } catch (error) {
+            console.error("Failed to load chat session", error);
+            throw error;
+        }
+    },
+    async saveCurrentChatSession(): Promise<void> {
+        if (!this.activeProject || this.chatHistory.length === 0) return;
+        
+        const messages = this.chatHistory.map(entry => ({
+            role: entry.role,
+            content: entry.text
+        }));
+        
+        try {
+            await saveChatSession({
+                project: this.activeProject,
+                messages
+            });
+            await this.loadChatHistory(); // Refresh list
+        } catch (error) {
+            console.error("Failed to save chat session", error);
+            throw error;
+        }
+    },
+    async deleteChatSession(sessionId: string): Promise<void> {
+        if (!this.activeProject) return;
+        try {
+            await deleteChatSession(sessionId, this.activeProject);
+            this.chatSessions = this.chatSessions.filter(s => s.id !== sessionId);
+        } catch (error) {
+            console.error("Failed to delete chat session", error);
+            throw error;
+        }
     },
     async loadDiagrams(): Promise<void> {
       if (!this.activeProject && !this.activeDatabase) {

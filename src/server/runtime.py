@@ -21,8 +21,15 @@ from ..agent import (
 from ..tools.datalake.manager import DatalakeManager
 from ..tools.duckdb_query_tool import DuckDBQueryTool, StructuredQueryResult
 from ..tools.duckdb_schema_manager import SchemaManager
+from .chat_history import ChatHistoryManager
 from .config import ServerSettings
-from .models import DatabaseStatsResponse, ReclaimSpaceResponse, TableStats
+from .models import (
+    AIAssistFieldResponse,
+    ChatMessage,
+    DatabaseStatsResponse,
+    ReclaimSpaceResponse,
+    TableStats,
+)
 
 
 class DuckDBRuntime:
@@ -38,6 +45,9 @@ class DuckDBRuntime:
         self._agent_init_lock = asyncio.Lock()
         self._agent_run_lock = asyncio.Lock()
         self._agent: Optional[DirectOpenAIAgent] = None
+
+        # Initialize chat history manager
+        self.chat_history_manager = ChatHistoryManager(self.settings)
 
         # Initialize datalake manager if datalakes are configured
         self.datalake_manager: Optional[DatalakeManager] = None
@@ -562,12 +572,40 @@ class DuckDBRuntime:
     ) -> str:
         await self._ensure_project_locked(project=project, database=database)
         agent = await self._ensure_agent()
+        # Set agent's project context to avoid "Multiple DuckDB projects detected" error
+        self._set_agent_project(agent, project=project, database=database)
 
         manager = self.schema_manager
         table_record = manager.get_table(table) or {}
         field_record = manager.get_field(table, field) or {}
 
         is_short = description_type == 'short'
+
+        if description_type == 'data_type':
+            # 1. Check actual schema
+            try:
+                schema_rows = await asyncio.to_thread(self.query_tool.fetch_table_schema, table)
+                for row in schema_rows:
+                    if str(row.get('name', '')).lower() == field.lower():
+                        return str(row.get('type', '')).upper()
+            except Exception:
+                pass
+
+            # 2. If not found in DB, try to infer from metadata values if available
+            values = field_record.get("values", {})
+            if values:
+                prompt = (
+                    f"Infer the DuckDB data type for field '{field}' in table '{table}'. "
+                    f"It has these allowed values: {', '.join(values.keys())}. "
+                    "Return ONLY the data type (e.g. VARCHAR, INTEGER, BOOLEAN)."
+                )
+                try:
+                    response = await asyncio.to_thread(agent.run, prompt, reset=False)
+                    return self._materialize_agent_response(response).strip()
+                except Exception:
+                    pass
+
+            return "UNKNOWN"
 
         if is_short:
             prompt_lines = [
@@ -619,6 +657,127 @@ class DuckDBRuntime:
             print(f"Full traceback:\n{traceback.format_exc()}")
             raise
 
+    async def ai_assist_field(
+        self,
+        *,
+        project: Optional[str],
+        database: Optional[str],
+        table: str,
+        field: str,
+    ) -> "AIAssistFieldResponse":
+        """
+        AI assist for field: fetches sample values from the database and generates
+        short description, long description, data type, and nullable status.
+        """
+        await self._ensure_project_locked(project=project, database=database)
+        agent = await self._ensure_agent()
+        # Set agent's project context
+        self._set_agent_project(agent, project=project, database=database)
+
+        # Fetch sample values and null count from the database
+        sample_values = []
+        has_nulls = False
+        try:
+            sql = f'SELECT DISTINCT "{field}" FROM "{table}" WHERE "{field}" IS NOT NULL LIMIT 20'
+            result = await asyncio.to_thread(self.query_tool.execute_structured, sql)
+            if result and hasattr(result, 'rows') and result.rows:
+                sample_values = [str(row[0]) for row in result.rows if row]
+
+            # Check for null values
+            null_sql = f'SELECT COUNT(*) FROM "{table}" WHERE "{field}" IS NULL'
+            null_result = await asyncio.to_thread(self.query_tool.execute_structured, null_sql)
+            if null_result and hasattr(null_result, 'rows') and null_result.rows:
+                null_count = null_result.rows[0][0]
+                has_nulls = null_count > 0
+        except Exception as e:
+            print(f"Warning: Could not fetch sample values for {table}.{field}: {e}")
+
+        # Get table context
+        manager = self.schema_manager
+        table_record = manager.get_table(table) or {}
+        table_context = " ".join(
+            filter(
+                None,
+                [
+                    str(table_record.get("short_description") or ""),
+                    str(table_record.get("long_description") or ""),
+                ],
+            )
+        )
+
+        # Build prompt for AI
+        prompt_parts = [
+            "You are assisting with documenting DuckDB database schemas.",
+            f"Analyze the field '{field}' in table '{table}'.",
+        ]
+
+        if table_context:
+            prompt_parts.append(f"Table context: {table_context}")
+
+        if sample_values:
+            sample_str = ", ".join(sample_values[:15])
+            if len(sample_values) > 15:
+                sample_str += f"... (and {len(sample_values) - 15} more)"
+            prompt_parts.append(f"Sample values from the database: {sample_str}")
+
+        prompt_parts.append(f"Null values found: {'Yes' if has_nulls else 'No'}")
+
+        prompt_parts.extend([
+            "",
+            "Based on this information, provide:",
+            "1. A short description (5-10 words, concise label)",
+            "2. A long description (2-3 sentences, detailed explanation)",
+            "3. The DuckDB data type - Important guidelines:",
+            "   - If values match pattern XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (8-4-4-4-12 hex characters), use UUID",
+            "   - Common types: VARCHAR, INTEGER, BOOLEAN, DATE, TIMESTAMP, UUID, DECIMAL",
+            "   - Choose the most specific type that matches the data pattern",
+            "4. Whether the field is nullable (true/false) - if no null values were found, assume NOT NULL",
+            "",
+            "Format your response EXACTLY as follows (use these exact labels):",
+            "SHORT: <short description>",
+            "LONG: <long description>",
+            "TYPE: <data type>",
+            "NULLABLE: <true or false>",
+            "",
+            "Use plain text only, no markdown formatting.",
+        ])
+
+        prompt = "\n".join(prompt_parts)
+
+        try:
+            response = await asyncio.to_thread(agent.run, prompt, reset=False)
+            result_text = self._materialize_agent_response(response).strip()
+
+            # Parse the response
+            short_desc = ""
+            long_desc = ""
+            data_type = ""
+            nullable = not has_nulls  # Default based on actual data
+
+            for line in result_text.split("\n"):
+                line = line.strip()
+                if line.startswith("SHORT:"):
+                    short_desc = line[6:].strip()
+                elif line.startswith("LONG:"):
+                    long_desc = line[5:].strip()
+                elif line.startswith("TYPE:"):
+                    data_type = line[5:].strip().upper()
+                elif line.startswith("NULLABLE:"):
+                    nullable_str = line[9:].strip().lower()
+                    nullable = nullable_str in ['true', 'yes', '1']
+
+            return AIAssistFieldResponse(
+                short_description=short_desc,
+                long_description=long_desc,
+                data_type=data_type,
+                nullable=nullable,
+            )
+        except Exception as e:
+            import traceback
+            print(f"Error in ai_assist_field: {e}")
+            print(f"Full traceback:\n{traceback.format_exc()}")
+            raise
+
     async def _ensure_agent(self) -> DirectOpenAIAgent:
         if self._agent is not None:
             return self._agent
@@ -630,6 +789,8 @@ class DuckDBRuntime:
                     default_database=self.workspace.default_database,
                     duckdb_executable=self.workspace.duckdb_executable,
                     max_steps=self.settings.agent_max_steps,
+                    timeout=self.settings.agent_timeout,
+                    max_retries=self.settings.agent_max_retries,
                     emit_status=False,
                 )
         return self._agent
@@ -665,14 +826,88 @@ class DuckDBRuntime:
         reset: bool = False,
         project: Optional[str] = None,
         database: Optional[str] = None,
+        file_content: Optional[str] = None,
+        filename: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        Run a chat interaction with the AI agent.
+        """
         agent = await self._ensure_agent()
         async with self._agent_run_lock:
             active_db = self._set_agent_project(agent, project=project, database=database)
-            response = await asyncio.to_thread(agent.run, message, reset=reset)
+
+            # Restore history if session exists
+            if session_id and project and not reset:
+                session = self.chat_history_manager.get_session(project, session_id)
+                if session:
+                    restored_history = []
+                    for msg in session.messages:
+                        msg_dict: Dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
+                        if msg.tool_calls:
+                            msg_dict["tool_calls"] = msg.tool_calls
+                        if msg.tool_call_id:
+                            msg_dict["tool_call_id"] = msg.tool_call_id
+                        restored_history.append(msg_dict)
+                    agent.conversation_history = self._sanitize_history(restored_history)
+
+            enhanced_message = message
+
+            # Append file content if provided
+            if file_content and filename:
+                processed_content = self._process_file_content(filename, file_content)
+                enhanced_message += f"\n\n[User uploaded file: {filename}]\n{processed_content}"
+
+            # Prepend project context if available
+            if active_db:
+                project_name = Path(active_db).stem
+                db_filename = Path(active_db).name
+                enhanced_message = (
+                    f"[Context: You are currently working with the '{project_name}' DuckDB project. "
+                    f"The database '{db_filename}' is already selected and active. "
+                    f"You do not need to specify database or project parameters in tool calls.]\n\n"
+                    f"{enhanced_message}"
+                )
+
+            response = await asyncio.to_thread(agent.run, enhanced_message, reset=reset)
+            reply_text = self._materialize_agent_response(response)
+
+            # Save session
+            current_session_id = session_id
+            if project:
+                messages = []
+                for msg in agent.conversation_history:
+                    # Skip system messages
+                    if msg.get("role") == "system":
+                        continue
+
+                    content = msg.get("content") or ""
+
+                    # Strip context from user messages
+                    if msg.get("role") == "user" and content.startswith("[Context:"):
+                        # Find the end of the context block
+                        context_end = content.find("]\n\n")
+                        if context_end != -1:
+                            content = content[context_end + 3:]
+                        else:
+                            # Fallback for different formatting
+                            content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
+
+                    messages.append(ChatMessage(
+                        role=str(msg.get("role") or "user"),
+                        content=content,
+                        tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
+                        tool_call_id=msg.get("tool_call_id")
+                    ))
+
+                saved_session = self.chat_history_manager.save_session(project, messages, session_id)
+                current_session_id = saved_session.id
+
             return {
-                "reply": self._materialize_agent_response(response),
+                "reply": reply_text,
                 "database": active_db,
+                "metadata": getattr(agent, 'execution_metadata', {}),
+                "session_id": current_session_id,
             }
 
     async def run_chat_stream(
@@ -682,6 +917,9 @@ class DuckDBRuntime:
         reset: bool = False,
         project: Optional[str] = None,
         database: Optional[str] = None,
+        file_content: Optional[str] = None,
+        filename: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         """Stream chat responses as they are generated."""
         print(f"DEBUG: run_chat_stream called with message={message}, project={project}")
@@ -692,6 +930,27 @@ class DuckDBRuntime:
             active_db = self._set_agent_project(agent, project=project, database=database)
             print(f"DEBUG: set agent project, active_db={active_db}")
 
+            # Restore history if session exists
+            if session_id and project and not reset:
+                session = self.chat_history_manager.get_session(project, session_id)
+                if session:
+                    restored_history = []
+                    for msg in session.messages:
+                        msg_dict: Dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
+                        if msg.tool_calls:
+                            msg_dict["tool_calls"] = msg.tool_calls
+                        if msg.tool_call_id:
+                            msg_dict["tool_call_id"] = msg.tool_call_id
+                        restored_history.append(msg_dict)
+                    agent.conversation_history = self._sanitize_history(restored_history)
+
+            enhanced_message = message
+
+            # Append file content if provided
+            if file_content and filename:
+                processed_content = self._process_file_content(filename, file_content)
+                enhanced_message += f"\n\n[User uploaded file: {filename}]\n{processed_content}"
+
             # Prepend project context to the message
             if active_db:
                 project_name = Path(active_db).stem
@@ -700,7 +959,7 @@ class DuckDBRuntime:
                     f"[Context: You are currently working with the '{project_name}' DuckDB project. "
                     f"The database '{db_filename}' is already selected and active. "
                     f"You do not need to specify database or project parameters in tool calls.]\n\n"
-                    f"{message}"
+                    f"{enhanced_message}"
                 )
             else:
                 enhanced_message = message
@@ -708,14 +967,45 @@ class DuckDBRuntime:
             try:
                 # Run agent in thread and capture response with timeout
                 print("DEBUG: calling agent.run in thread")
+                # Allow enough time for multiple steps with the configured timeout
+                execution_timeout = max(120.0, self.settings.agent_timeout * 3)
                 response = await asyncio.wait_for(
                     asyncio.to_thread(agent.run, enhanced_message, reset=reset),
-                    timeout=120.0  # 2 minute timeout
+                    timeout=execution_timeout
                 )
                 print(f"DEBUG: agent.run completed, response type={type(response)}")
                 reply_text = self._materialize_agent_response(response)
                 print(f"DEBUG: materialized response, length={len(reply_text)}")
                 print(f"DEBUG: reply_text content:\n{reply_text[:500]}...")  # First 500 chars
+
+                # Save session
+                current_session_id = session_id
+                if project:
+                    messages = []
+                    for msg in agent.conversation_history:
+                        # Skip system messages
+                        if msg.get("role") == "system":
+                            continue
+
+                        content = msg.get("content") or ""
+
+                        # Strip context from user messages
+                        if msg.get("role") == "user" and content.startswith("[Context:"):
+                            context_end = content.find("]\n\n")
+                            if context_end != -1:
+                                content = content[context_end + 3:]
+                            else:
+                                content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
+
+                        messages.append(ChatMessage(
+                            role=str(msg.get("role") or "user"),
+                            content=content,
+                            tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
+                            tool_call_id=msg.get("tool_call_id")
+                        ))
+
+                    saved_session = self.chat_history_manager.save_session(project, messages, session_id)
+                    current_session_id = saved_session.id
 
                 # Send the complete response
                 yield {
@@ -723,30 +1013,101 @@ class DuckDBRuntime:
                     "reply": reply_text,
                     "database": active_db,
                     "metadata": getattr(agent, 'execution_metadata', {}),
+                    "session_id": current_session_id,
                 }
                 print("DEBUG: sent response message")
 
                 # Send completion signal
-                yield {"type": "done", "database": active_db}
+                yield {"type": "done", "database": active_db, "session_id": current_session_id}
                 print("DEBUG: sent done message")
 
             except asyncio.TimeoutError:
                 print("DEBUG: agent execution timed out")
+                error_msg = "Request timed out after 2 minutes. The query may be too complex or the database too large."
+
+                # Append partial results if available
+                if agent._last_implementation_plan:
+                    error_msg += f"\n\n[PLAN:{agent._last_implementation_plan}]"
+                if agent._last_sql_query:
+                    error_msg += f"\n\n```sql\n{agent._last_sql_query}\n```"
+
+                # Save session with error
+                if project and session_id:
+                    try:
+                        agent.conversation_history.append({
+                            "role": "assistant",
+                            "content": f"Error: {error_msg}"
+                        })
+                        messages = []
+                        for msg in agent.conversation_history:
+                            if msg.get("role") == "system":
+                                continue
+                            content = msg.get("content") or ""
+                            if msg.get("role") == "user" and content.startswith("[Context:"):
+                                context_end = content.find("]\n\n")
+                                if context_end != -1:
+                                    content = content[context_end + 3:]
+                                else:
+                                    content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
+                            messages.append(ChatMessage(
+                                role=str(msg.get("role") or "user"),
+                                content=content,
+                                tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
+                                tool_call_id=msg.get("tool_call_id")
+                            ))
+                        self.chat_history_manager.save_session(project, messages, session_id)
+                    except Exception as save_err:
+                        print(f"Failed to save session on timeout: {save_err}")
+
                 yield {
                     "type": "error",
-                    "error": (
-                        "Request timed out after 2 minutes. "
-                        "The query may be too complex or the database too large."
-                    ),
+                    "error": error_msg,
                     "database": active_db,
                 }
             except Exception as e:
                 print(f"DEBUG: exception caught: {e}")
                 import traceback
                 traceback.print_exc()
+
+                error_msg = str(e)
+
+                # Append partial results if available
+                if agent._last_implementation_plan:
+                    error_msg += f"\n\n[PLAN:{agent._last_implementation_plan}]"
+                if agent._last_sql_query:
+                    error_msg += f"\n\n```sql\n{agent._last_sql_query}\n```"
+
+                # Save session with error
+                if project and session_id:
+                    try:
+                        agent.conversation_history.append({
+                            "role": "assistant",
+                            "content": f"Error: {error_msg}"
+                        })
+                        messages = []
+                        for msg in agent.conversation_history:
+                            if msg.get("role") == "system":
+                                continue
+                            content = msg.get("content") or ""
+                            if msg.get("role") == "user" and content.startswith("[Context:"):
+                                context_end = content.find("]\n\n")
+                                if context_end != -1:
+                                    content = content[context_end + 3:]
+                                else:
+                                    content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
+                            messages.append(ChatMessage(
+                                role=str(msg.get("role") or "user"),
+                                content=content,
+                                tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
+                                tool_call_id=msg.get("tool_call_id")
+                            ))
+                        self.chat_history_manager.save_session(project, messages, session_id)
+                    except Exception as save_err:
+                        print(f"Failed to save session on error: {save_err}")
+
                 yield {
                     "type": "error",
-                    "error": str(e),
+                    "error": error_msg,
                     "database": active_db,
                 }
 
@@ -769,8 +1130,9 @@ class DuckDBRuntime:
                 "which may contain comments describing what they want to do.\n"
                 "Please fix the query or implement the logic described in the comments.\n"
                 "Use DuckDB-specific syntax and functions where appropriate.\n"
-                "Return ONLY the valid SQL query. Do not include markdown formatting "
-                "(like ```sql ... ```) or explanations.\n\n"
+                "Return the valid SQL query. You MUST preserve the original comments in the output, "
+                "placing them above the corresponding SQL code.\n"
+                "Do not include markdown formatting (like ```sql ... ```) or explanations.\n\n"
                 f"Query:\n{sql}"
             )
 
@@ -818,6 +1180,24 @@ class DuckDBRuntime:
             return "".join(fragments)
 
         return str(response)
+
+    def _serialize_tool_calls(self, tool_calls: Optional[List[Any]]) -> Optional[List[Dict[str, Any]]]:
+        if not tool_calls:
+            return None
+        serialized = []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                serialized.append(tc)
+            elif hasattr(tc, "model_dump"):
+                serialized.append(tc.model_dump())
+            elif hasattr(tc, "dict"):
+                serialized.append(tc.dict())
+            else:
+                try:
+                    serialized.append(dict(tc))
+                except (ValueError, TypeError):
+                    pass
+        return serialized
 
     # Project metadata helpers -------------------------------------------------
 
@@ -880,11 +1260,54 @@ class DuckDBRuntime:
             manager = SchemaManager()
             manager.set_database(target)
             current_meta = manager.get_project_metadata()
+
+            # Update metadata first (persists to current schema file)
             manager.set_project_metadata(
                 display_name=display_name if display_name is not None else current_meta["display_name"],
                 description=description if description is not None else current_meta["description"],
                 version=version if version is not None else current_meta.get("version"),
             )
+
+            # Handle renaming if version changed
+            if version and version != current_meta.get("version"):
+                # Determine base name
+                stem = target.stem
+                # Regex to match _vX.Y.Z at the end
+                match = re.search(r"^(.*)_v\d+(\.\d+)*$", stem)
+                if match:
+                    base_name = match.group(1)
+                else:
+                    base_name = stem
+
+                new_stem = f"{base_name}_v{version}"
+                new_target = target.with_name(f"{new_stem}.duckdb")
+
+                # Rename .duckdb file
+                if new_target != target:
+                    try:
+                        target.rename(new_target)
+
+                        # Rename .schema.json file
+                        old_schema = target.with_suffix(".schema.json")
+                        new_schema = new_target.with_suffix(".schema.json")
+                        if old_schema.exists():
+                            old_schema.rename(new_schema)
+
+                        # Update active database reference if needed
+                        # We compare against the original resolved target
+                        if self.query_tool.current_database == target:
+                            self.query_tool.current_database = new_target
+
+                        # Update target to new path for return value
+                        target = new_target
+
+                        # Update schema manager's path to ensure consistency
+                        manager.set_database(target)
+                    except OSError as e:
+                        print(f"Failed to rename project files: {e}")
+                        # We don't raise here to at least return the metadata update,
+                        # but the file remains with old name.
+
             info = self._project_metadata_from_path(target)
             current = self.query_tool.current_database
             info["is_active"] = bool(current and target == current)
@@ -1222,5 +1645,286 @@ class DuckDBRuntime:
 
         return True
 
+    async def delete_field(
+        self,
+        *,
+        project: Optional[str],
+        database: Optional[str],
+        table: str,
+        field: str,
+    ) -> None:
+        async with self._query_lock:
+            resolved = await self._ensure_project_locked(project=project, database=database)
+            if resolved is None:
+                raise ValueError("No DuckDB database available to delete field.")
+            manager = self.schema_manager
+            removed = manager.delete_field(table, field)
+            if not removed:
+                raise ValueError(f"Field '{field}' not found in table '{table}'.")
 
-__all__ = ["DuckDBRuntime"]
+    async def enrich_table_from_file(
+        self,
+        *,
+        project: Optional[str],
+        database: Optional[str],
+        table: str,
+        filename: str,
+        file_content: bytes,
+    ) -> Dict[str, Any]:
+        """
+        Enrich table schema using metadata from an uploaded file (CSV, Excel, TXT).
+        """
+        async with self._query_lock:
+            resolved = await self._ensure_project_locked(project=project, database=database)
+            if resolved is None:
+                raise ValueError("No DuckDB database available.")
+
+            # 1. Parse the file
+            import io
+            content_text = ""
+            ext = Path(filename).suffix.lower()
+
+            try:
+                if ext == ".csv":
+                    import csv
+
+                    # Decode bytes to string
+                    text_content = file_content.decode("utf-8", errors="ignore")
+                    f = io.StringIO(text_content)
+                    reader = csv.reader(f)
+                    rows = []
+                    for i, row in enumerate(reader):
+                        if i >= 20:
+                            break
+                        rows.append(row)
+
+                    if rows:
+                        headers = rows[0]
+                        md_lines = ["| " + " | ".join(str(h) for h in headers) + " |"]
+                        md_lines.append("| " + " | ".join("---" for _ in headers) + " |")
+                        for row in rows[1:]:
+                            md_lines.append("| " + " | ".join(str(c) for c in row) + " |")
+                        content_text = "\n".join(md_lines)
+
+                elif ext == ".xlsx":
+                    try:
+                        import openpyxl
+                        wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=True, data_only=True)
+                        ws = wb.active
+                        rows = []
+                        if ws:
+                            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                                if i >= 20:
+                                    break
+                                rows.append(list(row))
+
+                        if rows:
+                            headers = rows[0]
+                            md_lines = ["| " + " | ".join(str(h) for h in headers) + " |"]
+                            md_lines.append("| " + " | ".join("---" for _ in headers) + " |")
+                            for row in rows[1:]:
+                                md_lines.append("| " + " | ".join(str(c) if c is not None else "" for c in row) + " |")
+                            content_text = "\n".join(md_lines)
+                    except ImportError:
+                        raise RuntimeError("openpyxl is required for Excel files.")
+
+                elif ext == ".xls":
+                    raise ValueError(".xls files are not supported without pandas. Please convert to .xlsx or .csv")
+                else:
+                    # Assume text
+                    content_text = file_content.decode("utf-8", errors="ignore")
+                    # Limit length
+                    if len(content_text) > 10000:
+                        content_text = content_text[:10000] + "...(truncated)"
+            except Exception as e:
+                raise ValueError(f"Failed to parse file '{filename}': {str(e)}")
+
+            # 2. Get current schema
+            manager = self.schema_manager
+            table_record = manager.get_table(table)
+            if not table_record:
+                raise ValueError(f"Table '{table}' not found in schema.")
+
+            # Get documented fields
+            documented_fields = set(table_record.get("fields", {}).keys())
+
+            # Get actual database fields to include undocumented ones
+            db_fields = set()
+            try:
+                schema_rows = await asyncio.to_thread(self.query_tool.fetch_table_schema, table)
+                for row in schema_rows:
+                    # PRAGMA table_info returns 'name' column
+                    if "name" in row:
+                        db_fields.add(str(row["name"]))
+            except Exception:
+                pass
+
+            # Merge fields (documented + actual)
+            fields = list(documented_fields.union(db_fields))
+
+            if not fields:
+                raise ValueError(f"No fields found for table '{table}'.")
+
+            # 3. Ask AI to map
+            agent = await self._ensure_agent()
+
+            prompt = (
+                "You are a schema enrichment assistant. Your task is to extract field descriptions "
+                "from a provided file content and map them to the fields of a specific database table.\n\n"
+                f"Target Table: {table}\n"
+                f"Target Fields: {', '.join(fields)}\n\n"
+                "Input File Content:\n"
+                f"{content_text}\n\n"
+                "Instructions:\n"
+                "1. Analyze the Input File Content to find descriptions or definitions that match the Target Fields.\n"
+                "2. Match fields based on name similarity or semantic meaning.\n"
+                "3. Return a JSON object where keys are the exact Target Field names "
+                "and values are the extracted descriptions.\n"
+                "4. Only include fields where you found a confident match.\n"
+                "5. Return ONLY the valid JSON string. Do not include markdown formatting "
+                "(like ```json) or explanations.\n"
+            )
+
+            response = await asyncio.to_thread(agent.run, prompt, reset=False)
+            result_text = self._materialize_agent_response(response).strip()
+
+            # Clean up markdown if present
+            result_text = re.sub(r"^```\w*\s*", "", result_text)
+            result_text = re.sub(r"\s*```$", "", result_text)
+
+            try:
+                mapping = json.loads(result_text)
+            except json.JSONDecodeError:
+                raise ValueError("AI failed to return valid JSON mapping.")
+
+            # 4. Apply updates
+            updated_count = 0
+            for field, description in mapping.items():
+                if field in fields and description:
+                    # We assume these are long descriptions if they are detailed,
+                    # or we could try to split them. For now, let's put it in long_description
+                    # and generate a short one if missing?
+                    # Or just put it in long_description.
+                    # The user asked to "enrich the fields".
+
+                    # Let's put it in long_description as it's safer for "enrichment"
+                    manager.update_field(table, field, long_description=description)
+
+                    # If short description is missing, maybe use the first sentence?
+                    # For now, let's just update long_description.
+                    updated_count += 1
+
+            return {
+                "success": True,
+                "table": table,
+                "updated_fields": updated_count,
+                "mapping": mapping
+            }
+
+    def _process_file_content(self, filename: str, content: str) -> str:
+        """
+        Process uploaded file content.
+        If it's a base64 data URL (Excel), decode and parse with openpyxl.
+        Otherwise return as is.
+        """
+        if content.startswith("data:") and ";base64," in content:
+            try:
+                import base64
+                import io
+
+                _, encoded = content.split(";base64,", 1)
+                decoded = base64.b64decode(encoded)
+
+                ext = Path(filename).suffix.lower()
+                if ext == ".xlsx":
+                    try:
+                        import openpyxl
+                        wb = openpyxl.load_workbook(io.BytesIO(decoded), read_only=True, data_only=True)
+                        ws = wb.active
+                        rows = []
+                        if ws:
+                            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                                if i >= 50:
+                                    break
+                                rows.append(list(row))
+
+                        if not rows:
+                            return "[Empty Excel file]"
+
+                        # Simple markdown table generation
+                        headers = rows[0]
+                        md_lines = []
+                        # Header
+                        md_lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+                        # Separator
+                        md_lines.append("| " + " | ".join("---" for _ in headers) + " |")
+                        # Rows
+                        for row in rows[1:]:
+                            md_lines.append("| " + " | ".join(str(c) if c is not None else "" for c in row) + " |")
+
+                        return "\n".join(md_lines)
+                    except ImportError:
+                        return "[Error: openpyxl is required to process Excel files. Please install it.]"
+                elif ext == ".xls":
+                    return "[Error: .xls files are not supported without pandas. Please convert to .xlsx or .csv]"
+                else:
+                    # Try to decode as utf-8 text if not excel
+                    try:
+                        return decoded.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return f"[Binary file {filename} uploaded. Size: {len(decoded)} bytes. Content not displayed.]"
+            except Exception as e:
+                return f"[Error processing file {filename}: {str(e)}]"
+
+        return content
+
+    def _sanitize_history(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Ensure history is valid for OpenAI API.
+        Specifically, ensure every tool call has a corresponding tool response.
+        """
+        sanitized = []
+        pending_tool_calls = {}  # id -> tool_call_dict
+
+        for msg in history:
+            role = msg.get("role")
+
+            # If we have pending tool calls and we see a non-tool message,
+            if pending_tool_calls and role != "tool":
+                # This shouldn't happen in a valid conversation, but if it does,
+                # we need to close out the pending calls.
+                for tool_call_id in list(pending_tool_calls.keys()):
+                    sanitized.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": (
+                            "Error: Tool execution was interrupted or response was lost."
+                        )
+                    })
+                    del pending_tool_calls[tool_call_id]
+
+            sanitized.append(msg)
+
+            if role == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    # Handle both object and dict access
+                    tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    if tc_id:
+                        pending_tool_calls[tc_id] = tc
+
+            elif role == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id in pending_tool_calls:
+                    del pending_tool_calls[tc_id]
+
+        # If we reached the end and still have pending tool calls, close them out
+        for tool_call_id in pending_tool_calls:
+            sanitized.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": (
+                    "Error: Tool execution was interrupted or response was lost."
+                )
+            })
+
+        return sanitized

@@ -354,6 +354,47 @@ class SchemaManager:
         self._save()
         return field_record
 
+    def delete_field(self, table: str, field: str) -> bool:
+        table_record = self.get_table(table)
+        if not table_record:
+            return False
+
+        fields = table_record.get("fields", {})
+
+        # Resolve actual key respecting case
+        actual_field = None
+        for key in fields.keys():
+            if key == field or key.lower() == field.lower():
+                actual_field = key
+                break
+
+        if actual_field is None:
+            return False
+
+        # Remove the field
+        del fields[actual_field]
+
+        # Remove relationships defined on this table using this field
+        relationships = table_record.get("relationships") or []
+        table_record["relationships"] = [
+            rel for rel in relationships
+            if rel.get("field") != actual_field
+        ]
+
+        # Remove relationships in other tables referencing this field
+        for table_name, other_table in (self.schema.get("tables") or {}).items():
+            rels = other_table.get("relationships") or []
+            other_table["relationships"] = [
+                rel for rel in rels
+                if not (
+                    rel.get("related_table") == table
+                    and rel.get("related_field") == actual_field
+                )
+            ]
+
+        self._save()
+        return True
+
     def rename_field(self, table: str, old_name: str, new_name: str) -> dict[str, Any]:
         if not new_name or new_name == old_name:
             return self.get_field(table, old_name) or {}

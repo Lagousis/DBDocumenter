@@ -22,8 +22,8 @@
           </label>
           <p v-if="error" class="error">{{ error }}</p>
           <footer class="dialog-actions">
-            <button type="button" class="link-button" @click="handleClose">Cancel</button>
-            <button type="submit" class="primary-button" :disabled="disabled">
+            <button type="button" class="secondary-button" @click="handleClose">Cancel</button>
+            <button type="submit" class="secondary-button" :disabled="disabled">
               {{ loading ? "Saving..." : "Save diagram" }}
             </button>
           </footer>
@@ -176,42 +176,32 @@ textarea:focus {
   background: rgba(253, 248, 241, 0.9);
 }
 
-.primary-button {
-  border: none;
-  border-radius: 12px;
-  padding: 0.5rem 1.2rem;
-  background: linear-gradient(135deg, #2563eb, #38bdf8);
+.secondary-button {
+  background-color: transparent;
+  color: #b26a45;
+  border: 1px solid #d89b6c;
+  border-radius: 6px;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.secondary-button:hover {
+  background-color: #9a5838;
+  border-color: #9a5838;
   color: #ffffff;
-  font-weight: 600;
-  cursor: pointer;
-  box-shadow: 0 8px 18px rgba(59, 130, 246, 0.28);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
 
-.primary-button:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 10px 22px rgba(59, 130, 246, 0.3);
-}
-
-.primary-button:disabled {
-  opacity: 0.6;
+.secondary-button:disabled {
+  opacity: 0.5;
   cursor: not-allowed;
-  box-shadow: none;
 }
 
-.link-button {
-  border: none;
-  background: transparent;
-  color: #1d4ed8;
-  font-weight: 600;
-  cursor: pointer;
-  font-size: 0.9rem;
-  padding: 0.35rem 0.6rem;
-  border-radius: 999px;
-}
-
-.link-button:hover {
-  background: rgba(255, 255, 255, 0.9);
+.secondary-button:disabled:hover {
+  background-color: transparent;
+  border-color: #d89b6c;
+  color: #b26a45;
 }
 
 .icon-button {

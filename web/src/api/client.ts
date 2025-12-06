@@ -1,10 +1,15 @@
 import axios from "axios";
 
 import type {
+    AIAssistFieldRequest,
+    AIAssistFieldResponse,
     AutoDescribeRequest,
     AutoDescribeResponse,
+    ChatHistorySaveRequest,
     ChatRequest,
     ChatResponse,
+    ChatSession,
+    ChatSessionSummary,
     DatabaseStatsResponse,
     DatalakeAddRequest,
     DatalakeInfo,
@@ -40,7 +45,7 @@ import type {
 const parsedTimeout = Number.parseInt(import.meta.env.VITE_API_TIMEOUT ?? "", 10);
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000",
-  timeout: Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 120000, // Increased default timeout to 120s
+  timeout: Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 600000, // Increased default timeout to 600s (10m) to match backend resilience
 });
 
 export async function fetchProjects(): Promise<ProjectInfo[]> {
@@ -59,17 +64,17 @@ export async function createProject(payload: ProjectCreateRequest): Promise<Proj
 }
 
 export async function fetchSchema(params: { project?: string; database?: string } = {}): Promise<SchemaResponse> {
-  const { data } = await api.get<SchemaResponse>("/schema", { params });
+  const { data } = await api.get<SchemaResponse>("/schema", { params: { ...params, _t: Date.now() } });
   return data;
 }
 
 export async function fetchTables(params: { project?: string; database?: string } = {}): Promise<string[]> {
-  const { data } = await api.get<string[]>("/schema/tables", { params });
+  const { data } = await api.get<string[]>("/schema/tables", { params: { ...params, _t: Date.now() } });
   return data;
 }
 
 export async function fetchDatabaseStats(params: { project?: string; database?: string } = {}): Promise<DatabaseStatsResponse> {
-  const { data } = await api.get<DatabaseStatsResponse>("/schema/stats", { params });
+  const { data } = await api.get<DatabaseStatsResponse>("/schema/stats", { params: { ...params, _t: Date.now() } });
   return data;
 }
 
@@ -141,6 +146,25 @@ export async function sendChatStream(
   }
 }
 
+export async function fetchChatHistory(project: string): Promise<ChatSessionSummary[]> {
+  const { data } = await api.get<ChatSessionSummary[]>("/chat/history", { params: { project } });
+  return data;
+}
+
+export async function fetchChatSession(sessionId: string, project: string): Promise<ChatSession> {
+  const { data } = await api.get<ChatSession>(`/chat/history/${sessionId}`, { params: { project } });
+  return data;
+}
+
+export async function saveChatSession(payload: ChatHistorySaveRequest): Promise<ChatSession> {
+  const { data } = await api.post<ChatSession>("/chat/history", payload);
+  return data;
+}
+
+export async function deleteChatSession(sessionId: string, project: string): Promise<void> {
+  await api.delete(`/chat/history/${sessionId}`, { params: { project } });
+}
+
 export async function updateFieldMetadata(payload: FieldUpdateRequest): Promise<FieldUpdateResponse> {
   const { data } = await api.post<FieldUpdateResponse>("/schema/field/update", payload);
   return data;
@@ -164,10 +188,15 @@ export async function autoDescribeField(payload: AutoDescribeRequest): Promise<A
   return data;
 }
 
+export async function aiAssistField(payload: AIAssistFieldRequest): Promise<AIAssistFieldResponse> {
+  const { data } = await api.post<AIAssistFieldResponse>("/schema/field/ai-assist", payload);
+  return data;
+}
+
 export async function fetchUndocumentedFields(
   params: { table: string; project?: string; database?: string },
 ): Promise<UndocumentedField[]> {
-  const { data } = await api.get<UndocumentedField[]>("/schema/fields/undocumented", { params });
+  const { data } = await api.get<UndocumentedField[]>("/schema/fields/undocumented", { params: { ...params, _t: Date.now() } });
   return data;
 }
 
@@ -252,4 +281,12 @@ export async function reclaimSpace(payload: ReclaimSpaceRequest): Promise<Reclai
 export async function assistQuery(payload: QueryAssistRequest): Promise<QueryAssistResponse> {
   const { data } = await api.post<QueryAssistResponse>("/query/assist", payload);
   return data;
+}
+
+export async function deleteField(
+  table: string,
+  field: string,
+  params: { project?: string; database?: string } = {},
+): Promise<void> {
+  await api.delete(`/schema/field/${table}/${field}`, { params });
 }

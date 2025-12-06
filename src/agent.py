@@ -7,10 +7,13 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+from openai import APIConnectionError, AzureOpenAI
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
 try:
     if __package__:
@@ -77,7 +80,7 @@ class DirectOpenAIAgent:
         self.chart_tool._agent_ref = self  # type: ignore[attr-defined]
 
         # Define function schemas
-        self.functions = [
+        self.functions: List[Dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
@@ -107,8 +110,8 @@ class DirectOpenAIAgent:
                 "function": {
                     "name": "duckdb_schema",
                     "description": (
-                        "Get schema information about tables, fields, relationships, and saved queries. "
-                        "Use before writing SQL to understand database structure."
+                        "Get or update schema information about tables, fields, relationships, and saved queries. "
+                        "Use this to understand database structure OR to document the database."
                     ),
                     "parameters": {
                         "type": "object",
@@ -120,19 +123,45 @@ class DirectOpenAIAgent:
                                     "list_fields",
                                     "get_table_info",
                                     "list_saved_queries",
-                                    "get_full_schema"
+                                    "get_full_schema",
+                                    "update_field",
+                                    "update_table",
+                                    "update_fields_batch"
                                 ],
                                 "description": (
                                     "list_tables: show all tables, "
                                     "list_fields: show fields for a table, "
                                     "get_table_info: detailed info with relationships, "
                                     "list_saved_queries: show saved SQL queries, "
-                                    "get_full_schema: complete schema summary"
+                                    "get_full_schema: complete schema summary, "
+                                    "update_field: update field metadata (desc, type), "
+                                    "update_table: update table metadata (desc), "
+                                    "update_fields_batch: update multiple fields (requires fields_json)"
                                 )
                             },
                             "table_name": {
                                 "type": "string",
-                                "description": "Table name (required for list_fields and get_table_info)"
+                                "description": "Table name (required for most actions)"
+                            },
+                            "field_name": {
+                                "type": "string",
+                                "description": "Field name (required for update_field)"
+                            },
+                            "fields_json": {
+                                "type": "string",
+                                "description": "JSON string list of fields for update_fields_batch"
+                            },
+                            "short_description": {
+                                "type": "string",
+                                "description": "Short summary for table/field (for update actions)"
+                            },
+                            "long_description": {
+                                "type": "string",
+                                "description": "Detailed description for table/field (for update actions)"
+                            },
+                            "data_type": {
+                                "type": "string",
+                                "description": "Data type for field (for update_field)"
                             }
                         },
                         "required": ["action"]
@@ -219,12 +248,23 @@ class DirectOpenAIAgent:
         # Function calling loop
         for iteration in range(self.max_iterations):
             api_calls += 1
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.conversation_history,
-                tools=self.functions,
-                tool_choice="auto"
-            )
+            try:
+                # Cast types for Pylance
+                messages_param: Iterable[ChatCompletionMessageParam] = self.conversation_history  # type: ignore
+                tools_param: Iterable[ChatCompletionToolParam] = self.functions  # type: ignore
+
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages_param,
+                    tools=tools_param,
+                    tool_choice="auto"
+                )
+            except APIConnectionError as e:
+                # Enhance the error message with the endpoint
+                raise RuntimeError(
+                    f"Connection failed to Azure OpenAI endpoint: {self.client.base_url}. "
+                    "Please check your internet connection and the AZURE_OPENAI_ENDPOINT setting."
+                ) from e
 
             # Capture token usage
             if hasattr(response, 'usage') and response.usage:
@@ -265,7 +305,12 @@ class DirectOpenAIAgent:
                 elif function_name == "duckdb_schema":
                     tool_result = self.schema_tool(
                         action=function_args["action"],
-                        table_name=function_args.get("table_name")
+                        table_name=function_args.get("table_name"),
+                        field_name=function_args.get("field_name"),
+                        short_description=function_args.get("short_description"),
+                        long_description=function_args.get("long_description"),
+                        data_type=function_args.get("data_type"),
+                        fields_json=function_args.get("fields_json")
                     )
                 elif function_name == "duckdb_chart":
                     tool_result = self.chart_tool(
@@ -486,6 +531,8 @@ def create_duckdb_agent(
     default_database: Optional[str | Path] = None,
     duckdb_executable: Optional[str | Path] = None,
     max_steps: int = 10,
+    timeout: float = 120.0,
+    max_retries: int = 5,
     emit_status: bool = True,
 ) -> DirectOpenAIAgent:
     """
@@ -511,6 +558,10 @@ def create_duckdb_agent(
         Path to the DuckDB CLI executable. Defaults to ``DUCKDB_EXECUTABLE`` if available.
     max_steps:
         Maximum number of function calling iterations permitted for the agent.
+    timeout:
+        Timeout for Azure OpenAI API calls in seconds.
+    max_retries:
+        Maximum number of retries for Azure OpenAI API calls.
     emit_status:
         When true, prints DuckDB workspace information during initialization (defaults to True for CLI usage).
     """
@@ -543,7 +594,9 @@ def create_duckdb_agent(
     client = AzureOpenAI(
         api_key=api_key,
         api_version=api_version,
-        azure_endpoint=azure_endpoint
+        azure_endpoint=azure_endpoint,
+        timeout=timeout,
+        max_retries=max_retries
     )
 
     if os.environ.get("AZURE_OPENAI_SKIP_CHECK", "").strip().lower() not in BOOL_TRUE:
@@ -613,6 +666,10 @@ def create_duckdb_agent(
         "   - Each data row should use pipes to separate columns\n"
         "   - Example: | column1 | column2 |\\n| --- | --- |\\n| value1 | value2 |\n"
         "7. For single-value results (one row, one column), you may present as plain text\n"
+        "8. Format numeric values intelligently:\n"
+        "   - For large numbers (> 1,000,000), do not show decimals (e.g., 1,234,567)\n"
+        "   - For other decimal numbers, limit to 2 decimal places (e.g., 123.45)\n"
+        "   - Use thousands separators for readability where appropriate\n"
         "\n"
         "Example workflows:\n"
         "User asks: 'Show me the delivery methods'\n"
@@ -656,8 +713,38 @@ def create_duckdb_agent(
         "- For schema details, use the duckdb_schema tool with actions: list_tables, list_fields, or get_schema\n"
         "- When showing data, select 3-4 important columns unless the user specifies otherwise\n"
         "- Use DuckDB-specific syntax for queries\n"
-        "- If a query fails, show the query to the user and attempt to fix it\n"
+        "   - If a query fails, show the query to the user and attempt to fix it\n"
         "- Write SQL and results directly in your answer as markdown, not as Python code or print statements\n"
+        "\n\n"
+        "DATA CLEANING AND ROBUSTNESS:\n"
+        "- Real-world data is often dirty. When casting strings to dates or numbers, ALWAYS use safe functions:\n"
+        "  - Use TRY_CAST(col AS TYPE) instead of CAST(col AS TYPE)\n"
+        "  - Use TRY_STRPTIME(col, 'format') instead of STRPTIME(col, 'format')\n"
+        "- These functions return NULL on failure instead of crashing the query.\n"
+        "- If you encounter 'Invalid Input Error', it means you need to use these safe functions.\n"
+        "- CHECK DATA TYPES: strptime() ONLY works on string (VARCHAR) columns.\n"
+        "  - If a column is already DATE or TIMESTAMP, do NOT use strptime().\n"
+        "  - Check the schema first. If it's a DATE, use it directly.\n"
+        "- REGEX FUNCTIONS: Use 'regexp_matches(string, pattern)' instead of 'regexp_match'.\n"
+        "\n\n"
+        "DOCUMENTATION UPDATES:\n"
+        "If the user provides metadata, descriptions, or a data dictionary (e.g., from an uploaded file):\n"
+        "1. FIRST: Check the actual database schema using duckdb_schema(action='list_fields', table_name='...')\n"
+        "   to see ALL fields in the table (both documented and undocumented).\n"
+        "2. Parse the user-provided information to identify field names and descriptions.\n"
+        "3. Match field names from the file to the actual database fields (case-insensitive, handle variations).\n"
+        "4. Use duckdb_schema(action='update_fields_batch') to SAVE/CREATE documentation for ALL matching fields.\n"
+        "5. IMPORTANT: The update_field/update_fields_batch actions will CREATE field documentation\n"
+        "   if it doesn't exist yet. You CAN document fields that exist in the database but aren't in the schema.\n"
+        "6. Do NOT just list the metadata in the chat; persist it to the schema.\n"
+        "7. Example workflow:\n"
+        "   a) User uploads Excel with field descriptions for 'members' table\n"
+        "   b) Call: duckdb_schema(action='list_fields', table_name='members') to see all fields\n"
+        "   c) Match Excel data to actual field names (handle spacing, underscores, etc.)\n"
+        "   d) Call: duckdb_schema(action='update_fields_batch', table_name='members', "
+        "fields_json='[{\"name\": \"contact_civility_title\", \"short_description\": \"Civility title\"}, "
+        "{\"name\": \"email\", \"short_description\": \"User email\"}]')\n"
+        "   e) Report: 'Updated documentation for 2 fields in members table'\n"
     )
 
     agent = DirectOpenAIAgent(
@@ -803,7 +890,7 @@ def main(argv: List[str] | None = None) -> int:
             reset = False
             continue
 
-        output = response.output if hasattr(response, "output") else response
+        output = response
         if isinstance(output, dict):
             output = output.get("output", output)
         print(f"Agent: {output}")

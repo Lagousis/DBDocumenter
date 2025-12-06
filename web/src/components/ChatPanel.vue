@@ -2,24 +2,37 @@
   <div class="chat-panel">
     <div class="chat-header">
       <h2 class="section-title">Assistant</h2>
-      <button 
-        v-if="chatHistory.length > 0" 
-        type="button" 
-        class="clear-chat-btn" 
-        @click="clearChat"
-        title="Clear chat history"
-      >
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M3 4h10M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1m2 0v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4h10z" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M6.5 7v4M9.5 7v4" stroke-linecap="round"/>
-        </svg>
-        Clear
-      </button>
+      <div class="header-actions">
+        <button 
+          v-if="activeProject"
+          type="button" 
+          class="icon-btn" 
+          @click="openHistory"
+          title="Chat History"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M8 3.5v4.5l3 3" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="8" cy="8" r="6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button 
+          v-if="chatHistory.length > 0" 
+          type="button" 
+          class="icon-btn danger" 
+          @click="clearChat"
+          title="Clear chat history"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M3 4h10M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1m2 0v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4h10z" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M6.5 7v4M9.5 7v4" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
     </div>
     <div v-if="!activeProject" class="warning-banner">
       Please select a project to start chatting with the assistant.
     </div>
-    <div class="transcript">
+    <div class="transcript" ref="transcriptContainer">
       <div v-if="chatHistory.length === 0 && !loadingChat" class="empty-state">
         Ask a question about your DuckDB projects to start a conversation.
       </div>
@@ -159,33 +172,87 @@
       </div>
     </div>
     <form class="composer" @submit.prevent="send">
-      <textarea
-        v-model="draft"
-        :disabled="loadingChat || !activeProject"
-        :placeholder="activeProject ? 'Ask about schemas, generate SQL, or request ER diagrams...' : 'Select a project to start chatting...'"
-        @keydown.enter="handleEnterKey"
-      ></textarea>
+      <div v-if="selectedFile" class="file-preview">
+        <span class="file-name">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" class="file-icon">
+            <path d="M3 3.5a.5.5 0 0 1 .5-.5h9a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5v-9z" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M3 6h10" stroke-linecap="round"/>
+          </svg>
+          {{ selectedFile.name }}
+        </span>
+        <button type="button" class="remove-file-btn" @click="removeFile" title="Remove file">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 4l-8 8M4 4l8 8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="input-area">
+        <textarea
+          v-model="draft"
+          :disabled="loadingChat || !activeProject"
+          :placeholder="activeProject ? 'Ask about schemas, generate SQL, or request ER diagrams...' : 'Select a project to start chatting...'"
+          @keydown.enter="handleEnterKey"
+        ></textarea>
+        <div class="composer-actions">
+          <input
+            type="file"
+            ref="fileInput"
+            class="hidden-file-input"
+            @change="handleFileSelect"
+            accept=".csv,.xlsx,.xls,.txt,.json,.md"
+            style="display: none"
+          />
+          <button 
+            type="button" 
+            class="attach-btn" 
+            @click="triggerFileSelect"
+            :disabled="loadingChat || !activeProject"
+            title="Attach file"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
+          <button type="submit" :disabled="loadingChat || !activeProject">
+            {{ loadingChat ? "Thinking..." : "Send" }}
+          </button>
+        </div>
+      </div>
       <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
-      <button type="submit" :disabled="loadingChat || !activeProject">
-        {{ loadingChat ? "Thinking..." : "Send" }}
-      </button>
     </form>
+    <ChatHistoryDialog 
+        :visible="historyVisible"
+        :sessions="chatSessions"
+        :loading="chatSessionsLoading"
+        :error="chatSessionsError"
+        @close="historyVisible = false"
+        @refresh="loadHistory"
+        @select="loadSession"
+        @delete="deleteSession"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
 import * as d3 from "d3";
 import { storeToRefs } from "pinia";
-import { nextTick, onMounted, onUpdated, ref } from "vue";
+import { nextTick, onMounted, onUpdated, ref, watch } from "vue";
 
 import { useSessionStore } from "../stores/session";
+import ChatHistoryDialog from "./ChatHistoryDialog.vue";
 
 const sessionStore = useSessionStore();
-const { chatHistory, loadingChat, activeProject } = storeToRefs(sessionStore);
+const { chatHistory, loadingChat, activeProject, chatSessions, chatSessionsLoading, chatSessionsError } = storeToRefs(sessionStore);
 const draft = ref("");
 const errorMessage = ref("");
 const expandedSqlBlocks = ref<Set<string>>(new Set());
 const chartRefs = ref<Map<string, SVGSVGElement>>(new Map());
+const historyVisible = ref(false);
+const transcriptContainer = ref<HTMLElement | null>(null);
+
+// File Upload State
+const selectedFile = ref<File | null>(null);
+const fileInput = ref<HTMLInputElement | null>(null);
 
 const colorPalette = [
   "#3b82f6", // blue
@@ -197,6 +264,23 @@ const colorPalette = [
   "#14b8a6", // teal
   "#f97316", // orange
 ];
+
+function handleFileSelect(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.files && input.files.length > 0) {
+    selectedFile.value = input.files[0];
+  }
+  // Reset input so same file can be selected again if needed
+  input.value = "";
+}
+
+function triggerFileSelect() {
+  fileInput.value?.click();
+}
+
+function removeFile() {
+  selectedFile.value = null;
+}
 
 interface MessageBlock {
   type: "text" | "table" | "sql" | "plan" | "chart";
@@ -504,6 +588,26 @@ function clearChat(): void {
   expandedSqlBlocks.value.clear();
 }
 
+function openHistory() {
+    historyVisible.value = true;
+    loadHistory();
+}
+
+async function loadHistory() {
+    await sessionStore.loadChatHistory();
+}
+
+async function loadSession(id: string) {
+    await sessionStore.loadChatSession(id);
+    historyVisible.value = false;
+}
+
+async function deleteSession(id: string) {
+    if (confirm("Are you sure you want to delete this chat session?")) {
+        await sessionStore.deleteChatSession(id);
+    }
+}
+
 function handleEnterKey(event: KeyboardEvent): void {
   // If Shift+Enter, allow default behavior (new line)
   if (event.shiftKey) {
@@ -520,18 +624,45 @@ async function send(): Promise<void> {
     errorMessage.value = "Please select a project first.";
     return;
   }
-  if (!draft.value.trim()) {
-    errorMessage.value = "Enter a question or instruction.";
+  if (!draft.value.trim() && !selectedFile.value) {
+    errorMessage.value = "Enter a question or attach a file.";
     return;
   }
   errorMessage.value = "";
   const content = draft.value;
+  const file = selectedFile.value;
+  
   draft.value = "";
+  selectedFile.value = null;
+  
   try {
-    await sessionStore.sendMessage(content);
+    let fileData = undefined;
+    if (file) {
+      let content = "";
+      // Check for binary file types (Excel)
+      const isBinary = /\.(xlsx|xls)$/i.test(file.name);
+      
+      if (isBinary) {
+        // Read as base64 for binary files
+        content = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      } else {
+        // Read as text for others
+        content = await file.text();
+      }
+      
+      fileData = { name: file.name, content };
+    }
+    
+    await sessionStore.sendMessage(content, fileData);
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : "Chat request failed.";
     draft.value = content;
+    selectedFile.value = file; // Restore file on error
   }
 }
 
@@ -975,8 +1106,25 @@ function renderInlineChart(
   }
 }
 
+function scrollToBottom() {
+  nextTick(() => {
+    if (transcriptContainer.value) {
+      transcriptContainer.value.scrollTop = transcriptContainer.value.scrollHeight;
+    }
+  });
+}
+
+watch(
+  [chatHistory, loadingChat],
+  () => {
+    scrollToBottom();
+  },
+  { deep: true }
+);
+
 onMounted(() => {
   renderInlineCharts();
+  scrollToBottom();
 });
 
 onUpdated(() => {
@@ -1003,6 +1151,35 @@ onUpdated(() => {
 
 .section-title {
   margin: 0;
+}
+
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  color: #64748b;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.icon-btn:hover {
+  background: #f1f5f9;
+  color: #334155;
+}
+
+.icon-btn.danger {
+    color: #ef4444;
+    border-color: #ef4444;
+}
+
+.icon-btn.danger:hover {
+    background: #ef4444;
+    color: white;
 }
 
 .clear-chat-btn {
@@ -1291,25 +1468,118 @@ onUpdated(() => {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  background: white;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 0.5rem;
+}
+
+.file-preview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: #f1f5f9;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: #334155;
+  border: 1px solid #e2e8f0;
+}
+
+.file-name {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-icon {
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.remove-file-btn {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 0.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.remove-file-btn:hover {
+  background-color: #e2e8f0;
+  color: #ef4444;
+}
+
+.input-area {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
 
 textarea {
-  min-height: 90px;
-  border-radius: 8px;
-  border: 1px solid #cbd5f5;
-  padding: 0.75rem;
+  min-height: 60px;
+  border: none;
+  padding: 0.25rem;
   resize: vertical;
   font-family: "Inter", "Segoe UI", sans-serif;
+  outline: none;
+  width: 100%;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 0.25rem;
+  border-top: 1px solid #f1f5f9;
+}
+
+.attach-btn {
+  background: transparent;
+  border: none;
+  color: #64748b;
+  cursor: pointer;
+  padding: 0.5rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.attach-btn:hover {
+  background-color: #f1f5f9;
+  color: #3b82f6;
+}
+
+.attach-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 button[type="submit"] {
-  align-self: flex-end;
   background-color: #1d4ed8;
   color: #ffffff;
   border: none;
   border-radius: 6px;
-  padding: 0.45rem 0.9rem;
+  padding: 0.4rem 0.9rem;
   cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background-color 0.2s;
+}
+
+button[type="submit"]:hover {
+  background-color: #1e40af;
 }
 
 button[type="submit"]:disabled {

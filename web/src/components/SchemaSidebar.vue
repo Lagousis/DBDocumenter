@@ -158,7 +158,28 @@
             <div class="fields-actions">
               <button
                 type="button"
-                class="icon-button"
+                class="icon-button small"
+                title="Refresh fields"
+                @click="refreshFields"
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="M23 4v6h-6" />
+                  <path d="M1 20v-6h6" />
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="icon-button small"
                 title="Generate sample query (key columns)"
                 @click="generateQuery(false)"
               >
@@ -170,13 +191,13 @@
               </button>
               <button
                 type="button"
-                class="icon-button"
+                class="icon-button small"
                 title="Generate full query (all columns)"
                 @click="generateQuery(true)"
               >
                 <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.4">
                   <rect x="3.5" y="4" width="11" height="10" rx="1.5" />
-                  <line x1="6.5" y1="4" x2="6.5" y2="14" />
+                  <line x="6.5" y1="4" x2="6.5" y2="14" />
                   <line x1="9" y1="4" x2="9" y2="14" />
                   <line x1="11.5" y1="4" x2="11.5" y2="14" />
                 </svg>
@@ -407,11 +428,13 @@ watch(
 );
 
 watch(
-  () => selectedDetails.value?.name,
-  (name) => {
-    fieldSearchTerm.value = "";
-    loadUndocumented(name);
-    diagramActionError.value = "";
+  selectedDetails,
+  (newDetails, oldDetails) => {
+    if (newDetails?.name !== oldDetails?.name) {
+      fieldSearchTerm.value = "";
+      diagramActionError.value = "";
+    }
+    loadUndocumented(newDetails?.name);
   },
   { immediate: true },
 );
@@ -571,6 +594,12 @@ function openTableEditor() {
 
 async function handleTableEditorSaved() {
   await sessionStore.refreshMetadata();
+}
+
+async function refreshFields() {
+  if (!selectedDetails.value?.name) return;
+  await sessionStore.refreshMetadata();
+  await loadUndocumented(selectedDetails.value.name);
 }
 
 function generateQuery(includeAll: boolean) {

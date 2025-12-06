@@ -67,11 +67,18 @@ class ChatRequest(BaseModel):
     reset: bool = Field(False, description="When true, resets the conversation history.")
     project: Optional[str] = Field(None, description="Optional project name to activate before responding.")
     database: Optional[str] = Field(None, description="Explicit DuckDB file path to activate before responding.")
+    file_content: Optional[str] = Field(
+        None,
+        description="Optional file content (text or base64) to include in context."
+    )
+    filename: Optional[str] = Field(None, description="Optional filename for the uploaded content.")
+    session_id: Optional[str] = Field(None, description="Optional session ID to continue an existing chat.")
 
 
 class ChatResponse(BaseModel):
     reply: str
     database: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class SchemaResponse(BaseModel):
@@ -142,6 +149,20 @@ class AutoDescribeRequest(BaseModel):
 
 class AutoDescribeResponse(BaseModel):
     description: str
+
+
+class AIAssistFieldRequest(BaseModel):
+    project: Optional[str] = None
+    database: Optional[str] = None
+    table: str
+    field: str
+
+
+class AIAssistFieldResponse(BaseModel):
+    short_description: str
+    long_description: str
+    data_type: str
+    nullable: bool
 
 
 class DiagramTablePosition(BaseModel):
@@ -302,6 +323,36 @@ class QueryAssistResponse(BaseModel):
     sql: str = Field(..., description="The improved or fixed SQL query.")
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: Optional[str] = ""
+    timestamp: Optional[float] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+
+
+class ChatSession(BaseModel):
+    id: str
+    project: str
+    created_at: float
+    description: str
+    messages: List[ChatMessage]
+
+
+class ChatSessionSummary(BaseModel):
+    id: str
+    project: str
+    created_at: float
+    description: str
+    message_count: int
+
+
+class ChatHistorySaveRequest(BaseModel):
+    project: str
+    messages: List[ChatMessage]
+    session_id: Optional[str] = None
+
+
 __all__ = [
     "ProjectInfo",
     "ProjectUpdateRequest",
@@ -320,6 +371,8 @@ __all__ = [
     "TableUpdateResponse",
     "AutoDescribeRequest",
     "AutoDescribeResponse",
+    "AIAssistFieldRequest",
+    "AIAssistFieldResponse",
     "DiagramTablePosition",
     "DiagramRecord",
     "DiagramSaveRequest",
@@ -337,4 +390,8 @@ __all__ = [
     "ReclaimSpaceResponse",
     "QueryAssistRequest",
     "QueryAssistResponse",
+    "ChatMessage",
+    "ChatSession",
+    "ChatSessionSummary",
+    "ChatHistorySaveRequest",
 ]

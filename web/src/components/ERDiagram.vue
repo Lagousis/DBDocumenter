@@ -1004,12 +1004,51 @@ async function exportDiagram(): Promise<void> {
     if (!svgNode) {
       throw new Error("Unable to locate diagram SVG.");
     }
+    
+    // Calculate bounding box of all diagram elements
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    
+    nodePositions.forEach((pos, name) => {
+      const dims = nodeDimensions.get(name);
+      if (dims) {
+        minX = Math.min(minX, pos.x);
+        minY = Math.min(minY, pos.y);
+        maxX = Math.max(maxX, pos.x + dims.width);
+        maxY = Math.max(maxY, pos.y + dims.height);
+      }
+    });
+    
+    // Fallback if no nodes found
+    if (!isFinite(minX) || !isFinite(minY)) {
+      minX = 0;
+      minY = 0;
+      maxX = 1200;
+      maxY = 800;
+    }
+    
+    // Add padding
+    const padding = 40;
+    minX = minX - padding;
+    minY = minY - padding;
+    maxX = maxX + padding;
+    maxY = maxY + padding;
+    
+    const width = maxX - minX;
+    const height = maxY - minY;
+    
     const svgClone = svgNode.cloneNode(true) as SVGSVGElement;
     svgClone.removeAttribute("style");
-    const width = svgNode.viewBox.baseVal.width || svgNode.clientWidth || 1200;
-    const height = svgNode.viewBox.baseVal.height || svgNode.clientHeight || 800;
+    
+    // Remove action buttons (black boxes) from the export
+    const actionGroups = svgClone.querySelectorAll('.node-actions');
+    actionGroups.forEach(group => group.remove());
+    
     svgClone.setAttribute("width", `${width}`);
     svgClone.setAttribute("height", `${height}`);
+    svgClone.setAttribute("viewBox", `${minX} ${minY} ${width} ${height}`);
     svgClone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
     const svgString = serializer.serializeToString(svgClone);
     const blob = new Blob([`<?xml version="1.0" encoding="UTF-8"?>\n${svgString}`], {
