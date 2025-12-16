@@ -44,9 +44,6 @@
           </svg>
           <span>{{ exporting ? "Exporting…" : "Export" }}</span>
         </button>
-        <button type="button" class="summary-toggle" @click="showSummary = !showSummary">
-          {{ showSummary ? "Hide details" : "Show details" }}
-        </button>
       </div>
     </div>
     <div v-if="!tables.length" class="diagram-body">
@@ -54,29 +51,14 @@
         Diagram has no tables to render yet. Open a diagram from the schema panel to get started.
       </p>
     </div>
-    <div v-else class="diagram-body populated" :class="{ 'no-summary': !showSummary }">
-      <div class="diagram-view" :class="{ 'full-width': !showSummary }">
+    <div v-else class="diagram-body populated">
+      <div class="diagram-view full-width">
         <div v-if="!diagramData" class="diagram-placeholder">
           No schema metadata available for the selected tables yet.
         </div>
         <div v-else ref="diagramElement" class="diagram-svg"></div>
         <p v-if="renderError" class="diagram-error" role="alert">
           Unable to render diagram: {{ renderError }}
-        </p>
-      </div>
-      <div v-if="showSummary" class="diagram-summary">
-        <h3>{{ primaryTable }}</h3>
-        <p v-if="relatedTables.length === 0" class="diagram-text">
-          No documented relationships for this table yet.
-        </p>
-        <div v-else>
-          <p class="diagram-text">Related tables</p>
-          <ul>
-            <li v-for="table in relatedTables" :key="table">{{ table }}</li>
-          </ul>
-        </div>
-        <p class="diagram-note">
-          Drag tables to rearrange. Scroll or pinch to zoom. Close the tab when you're done.
         </p>
       </div>
     </div>
@@ -103,7 +85,7 @@
 import * as d3 from "d3";
 import { saveAs } from "file-saver";
 import { storeToRefs } from "pinia";
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { useSessionStore, type DiagramTabState } from "../stores/session";
 import type { DiagramTablePosition } from "../types/api";
@@ -205,7 +187,6 @@ const relatedTables = computed(() =>
 
 const diagramElement = ref<HTMLDivElement | null>(null);
 const renderError = ref("");
-const showSummary = ref(true);
 const exporting = ref(false);
 const showSaveDialog = ref(false);
 const saveDialogError = ref("");
@@ -271,6 +252,7 @@ function collectDiagramLayout(): DiagramTablePosition[] {
       continue;
     }
     const position = nodePositions.get(name);
+    const dims = nodeDimensions.get(name);
     if (!position) {
       continue;
     }
@@ -278,6 +260,7 @@ function collectDiagramLayout(): DiagramTablePosition[] {
       name,
       x: position.x,
       y: position.y,
+      width: dims?.width,
     });
   }
   return layout;
@@ -313,9 +296,9 @@ async function handleSaveDiagram(payload: { name: string; description: string })
     showSaveDialog.value = false;
     props.tab.diagramId = record.id;
     props.tab.diagramDescription = record.description ?? "";
-    const nextLayout: Record<string, { x: number; y: number }> = {};
+    const nextLayout: Record<string, { x: number; y: number; width?: number }> = {};
     for (const table of record.tables) {
-      nextLayout[table.name] = { x: table.x, y: table.y };
+      nextLayout[table.name] = { x: table.x, y: table.y, width: table.width };
     }
     props.tab.layout = nextLayout;
     sessionStore.markDiagramDirty(props.tab.id, false);
@@ -460,8 +443,10 @@ const diagramData = computed<DiagramData | null>(() => {
 
 function computeDimensions(table: DiagramTable): { width: number; height: number } {
   const rows = Math.max(table.fields.length, 1);
+  const savedLayout = props.tab.layout?.[table.name];
+  const width = savedLayout?.width ?? NODE_WIDTH;
   return {
-    width: NODE_WIDTH,
+    width,
     height: HEADER_HEIGHT + rows * ROW_HEIGHT,
   };
 }
@@ -756,6 +741,80 @@ function updateNodes(): void {
     .attr("text-anchor", "middle");
   nodeEnter.append("g").attr("class", "node-fields");
 
+  const resizeHandle = nodeEnter
+    .append("g")
+    .attr("class", "resize-handle")
+    .style("cursor", "ew-resize")
+    .call(
+      d3
+        .drag<SVGGElement, DiagramTable>()
+        .on("start", function (event) {
+          event.sourceEvent.stopPropagation();
+        })
+        .on("drag", function (this: SVGGElement, event: DiagramDragEvent, d: DiagramTable) {
+          const currentDims = nodeDimensions.get(d.name);
+          if (!currentDims) return;
+
+          const newWidth = Math.max(NODE_WIDTH, currentDims.width + event.dx);
+          const newDims = { ...currentDims, width: newWidth };
+          nodeDimensions.set(d.name, newDims);
+
+          const pos = nodePositions.get(d.name);
+          if (pos) {
+            sessionStore.updateDiagramLayout(props.tab.id, d.name, {
+              x: pos.x,
+              y: pos.y,
+              width: newWidth,
+            });
+          }
+
+          const node = d3.select(this.parentNode as SVGGElement);
+
+          node.select<SVGRectElement>("rect.node-outline").attr("width", newDims.width);
+          node.select<SVGRectElement>("rect.node-header").attr("width", newDims.width);
+          node.select<SVGLineElement>("line.node-divider").attr("x2", newDims.width);
+          node.select<SVGTextElement>("text.node-title").attr("x", newDims.width / 2);
+          node.selectAll("text.field-type").attr("x", newDims.width - 12);
+          node
+            .select<SVGGElement>("g.node-actions")
+            .attr("transform", `translate(${Math.max(newDims.width - 48, 8)}, 7)`);
+          node
+            .select<SVGGElement>("g.resize-handle")
+            .attr("transform", `translate(${newDims.width}, 0)`);
+          
+          node
+            .select<SVGRectElement>("rect.resize-hit-area")
+            .attr("height", newDims.height);
+
+          node
+            .select<SVGLineElement>("line.resize-visual")
+            .attr("y1", newDims.height / 2 - 8)
+            .attr("y2", newDims.height / 2 + 8);
+
+          updateLinks();
+        })
+        .on("end", function () {
+          sessionStore.markDiagramDirty(props.tab.id, true);
+        }),
+    );
+
+  resizeHandle
+    .append("rect")
+    .attr("class", "resize-hit-area")
+    .attr("width", 16)
+    .attr("x", -8)
+    .attr("fill", "#fff")
+    .attr("fill-opacity", "0")
+    .attr("stroke", "none");
+
+  resizeHandle
+    .append("line")
+    .attr("class", "resize-visual")
+    .attr("x1", 0)
+    .attr("x2", 0)
+    .attr("stroke", COLORS.nodeBorder)
+    .attr("stroke-width", 2);
+
   const mergedNodes = nodeEnter.merge(nodeSelection);
 
   mergedNodes.each(function (this: SVGGElement, table: DiagramTable) {
@@ -795,6 +854,19 @@ function updateNodes(): void {
 
     const actions = group.select<SVGGElement>("g.node-actions");
     actions.attr("transform", `translate(${Math.max(dims.width - 48, 8)}, 7)`);
+
+    const resize = group.select<SVGGElement>("g.resize-handle");
+    resize.attr("transform", `translate(${dims.width}, 0)`);
+
+    resize
+      .select<SVGRectElement>("rect.resize-hit-area")
+      .attr("height", dims.height)
+      .attr("y", 0);
+
+    resize
+      .select<SVGLineElement>("line.resize-visual")
+      .attr("y1", dims.height / 2 - 8)
+      .attr("y2", dims.height / 2 + 8);
 
     const selectAction = actions.select<SVGGElement>("g.action-select");
     selectAction
@@ -846,7 +918,7 @@ function updateNodes(): void {
 
     fieldMerge
       .select<SVGTextElement>("text.field-type")
-      .attr("x", NODE_WIDTH - 12)
+      .attr("x", dims.width - 12)
       .attr("y", ROW_HEIGHT / 2 + 5)
       .attr("text-anchor", "end")
       .attr("font-family", FONT_FAMILY)
@@ -939,14 +1011,8 @@ watch(
   { immediate: true },
 );
 
-watch(
-  showSummary,
-  () => {
-    void nextTick(() => {
-      handleResize();
-    });
-  },
-);
+// Removed showSummary watcher
+
 
 watch(
   () => ({ requestedTab: diagramSavePromptTabId.value, dataReady: diagramData.value }),

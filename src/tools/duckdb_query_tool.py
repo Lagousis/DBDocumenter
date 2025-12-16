@@ -316,10 +316,12 @@ class DuckDBQueryTool(Tool):
             for idx, value in enumerate(row):
                 col_widths[idx] = max(col_widths[idx], len(value))
 
-        header = " | ".join(col.ljust(col_widths[idx]) for idx, col in enumerate(columns))
-        separator = "-+-".join("-" * col_widths[idx] for idx in range(len(columns)))
+        # Use Markdown-compatible pipe format with outer pipes
+        header = "| " + " | ".join(col.ljust(col_widths[idx]) for idx, col in enumerate(columns)) + " |"
+        separator = "| " + " | ".join("-" * col_widths[idx] for idx in range(len(columns))) + " |"
         data_lines = [
-            " | ".join(value.ljust(col_widths[idx]) for idx, value in enumerate(row)) for row in str_rows
+            "| " + " | ".join(value.ljust(col_widths[idx]) for idx, value in enumerate(row)) + " |"
+            for row in str_rows
         ]
 
         table = "\n".join([header, separator, *data_lines])
@@ -330,9 +332,13 @@ class DuckDBQueryTool(Tool):
         if not rows:
             return "Query executed successfully but returned no rows."
 
-        lines = ["\t".join(columns)]
+        # Use Markdown-compatible pipe format
+        header = "| " + " | ".join(columns) + " |"
+        separator = "| " + " | ".join("-" * max(3, len(col)) for col in columns) + " |"
+
+        lines = [header, separator]
         for row in rows:
-            lines.append("\t".join(DuckDBQueryTool._stringify(value) for value in row))
+            lines.append("| " + " | ".join(DuckDBQueryTool._stringify(value) for value in row) + " |")
         return "\n".join(lines)
 
     @staticmethod

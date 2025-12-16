@@ -125,7 +125,7 @@ async function loadStats() {
       name: t.name,
       rowCount: t.row_count,
     }));
-    totalSizePretty.value = response.total_size_pretty || null;
+    totalSizePretty.value = response.database_size_pretty || null;
   } catch (e: any) {
     console.error("Failed to load database stats", e);
     error.value = e.response?.data?.detail || e.message || "Failed to load database statistics.";

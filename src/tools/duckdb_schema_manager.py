@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Set
 from uuid import uuid4
@@ -38,6 +39,8 @@ class SchemaManager:
             self.schema["project"] = project_id
         if "version" not in self.schema or not isinstance(self.schema["version"], str):
             self.schema["version"] = "1.0.0"
+        if "query_instructions" not in self.schema or not isinstance(self.schema["query_instructions"], str):
+            self.schema["query_instructions"] = ""
         if not isinstance(self.schema.get("diagrams"), list):
             self.schema["diagrams"] = []
         if not isinstance(self.schema.get("queries"), list):
@@ -51,6 +54,7 @@ class SchemaManager:
             "project_display_name": project,
             "project_description": "",
             "version": "1.0.0",
+            "query_instructions": "",
             "tables": {},
             "diagrams": [],
             "queries": [],
@@ -75,10 +79,12 @@ class SchemaManager:
         display_name = str(self.schema.get("project_display_name") or self.schema.get("project") or "")
         description = str(self.schema.get("project_description") or "")
         version = str(self.schema.get("version") or "1.0.0")
+        query_instructions = str(self.schema.get("query_instructions") or "")
         return {
             "display_name": display_name,
             "description": description,
             "version": version,
+            "query_instructions": query_instructions,
         }
 
     def set_project_metadata(
@@ -87,6 +93,7 @@ class SchemaManager:
         display_name: Optional[str] = None,
         description: Optional[str] = None,
         version: Optional[str] = None,
+        query_instructions: Optional[str] = None,
     ) -> dict[str, str]:
         changed = False
         if display_name is not None:
@@ -100,11 +107,18 @@ class SchemaManager:
                 self.schema["project_description"] = description
                 changed = True
         if version is not None:
-            if version != self.schema.get("version"):
-                self.schema["version"] = version
+            cleaned_ver = version.strip()
+            if cleaned_ver != self.schema.get("version"):
+                self.schema["version"] = cleaned_ver
                 changed = True
+        if query_instructions is not None:
+            if query_instructions != self.schema.get("query_instructions"):
+                self.schema["query_instructions"] = query_instructions
+                changed = True
+
         if changed:
             self._save()
+
         return self.get_project_metadata()
 
     def list_fields(self, table: Optional[str] = None) -> dict[str, List[str]]:
@@ -167,9 +181,16 @@ class SchemaManager:
             try:
                 x = float(entry.get("x", 0))
                 y = float(entry.get("y", 0))
+                width = entry.get("width")
+                if width is not None:
+                    width = float(width)
             except (TypeError, ValueError):
                 continue
-            stored_tables.append({"name": raw_name, "x": x, "y": y})
+            
+            table_data = {"name": raw_name, "x": x, "y": y}
+            if width is not None:
+                table_data["width"] = width
+            stored_tables.append(table_data)
 
         diagram_record = {
             "id": target_id,
@@ -258,6 +279,7 @@ class SchemaManager:
             "description": cleaned_description,
             "sql": cleaned_sql,
             "limit": limit_value,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
         queries = self.schema["queries"]
@@ -328,6 +350,7 @@ class SchemaManager:
         nullability: Optional[str] = None,
         data_type: Optional[str] = None,
         values: Optional[dict[str, str]] = None,
+        ignored: Optional[bool] = None,
     ) -> dict[str, Any]:
         table_record = self._ensure_table(table)
         fields = table_record.setdefault("fields", {})
@@ -339,6 +362,7 @@ class SchemaManager:
                 "nullability": "",
                 "data_type": "",
                 "values": {},
+                "ignored": False,
             },
         )
         if short_description is not None:
@@ -351,6 +375,8 @@ class SchemaManager:
             field_record["data_type"] = data_type
         if values is not None:
             field_record["values"] = values
+        if ignored is not None:
+            field_record["ignored"] = ignored
         self._save()
         return field_record
 

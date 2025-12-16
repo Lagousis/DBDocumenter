@@ -76,7 +76,7 @@ class ServerSettings:
     port: int = 8000
     allowed_origins: List[str] = field(default_factory=list)
     query_default_limit: int = 200
-    agent_max_steps: int = 8
+    agent_max_steps: int = 15
     agent_timeout: float = 180.0
     agent_max_retries: int = 10
     datalakes: List[DatalakeConfig] = field(default_factory=list)
@@ -103,9 +103,9 @@ class ServerSettings:
 
         max_steps_value = os.environ.get("DBDOC_AGENT_MAX_STEPS", "")
         try:
-            agent_max_steps = int(max_steps_value) if max_steps_value else 8
+            agent_max_steps = int(max_steps_value) if max_steps_value else 15
         except ValueError:
-            agent_max_steps = 8
+            agent_max_steps = 15
 
         timeout_value = os.environ.get("DBDOC_AGENT_TIMEOUT", "")
         try:

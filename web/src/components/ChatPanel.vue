@@ -18,13 +18,13 @@
         <button 
           v-if="chatHistory.length > 0" 
           type="button" 
-          class="icon-btn danger" 
+          class="icon-btn" 
           @click="clearChat"
-          title="Clear chat history"
+          title="Start new chat"
         >
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M3 4h10M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1m2 0v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4h10z" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M6.5 7v4M9.5 7v4" stroke-linecap="round"/>
+            <path d="M12 8v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M10 3h3m0 0v3m0-3L7 9" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
       </div>
@@ -45,6 +45,7 @@
       >
         <div class="message-header">
           <span class="label">{{ entry.role === "user" ? "You" : "Assistant" }}</span>
+          <span class="timestamp">{{ formatTimestamp(entry.timestamp) }}</span>
           <button
             v-if="entry.role === 'assistant' && entry.metadata"
             type="button"
@@ -62,6 +63,16 @@
           <template v-for="(block, idx) in parseMessage(entry.text)" :key="idx">
             <div v-if="block.type === 'text'" class="text-block" v-html="block.content"></div>
             <div v-else-if="block.type === 'table'" class="table-container">
+              <div class="table-header">
+                <span class="table-label">Results</span>
+                <button type="button" class="export-csv-btn" @click="exportTableToCsv(block)" title="Export to CSV">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M2.5 8h11M8 2.5v11" stroke-linecap="round" stroke-linejoin="round" transform="rotate(45 8 8)"/>
+                    <path d="M14 9v4.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 13.5v-9A1.5 1.5 0 0 1 3.5 3H8" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  Export CSV
+                </button>
+              </div>
               <table class="data-table">
                 <thead>
                   <tr>
@@ -172,6 +183,16 @@
       </div>
     </div>
     <form class="composer" @submit.prevent="send">
+      <div v-if="pastedImages.length > 0" class="pasted-images">
+        <div v-for="(img, index) in pastedImages" :key="index" class="image-preview">
+          <img :src="img.data" alt="Pasted image" />
+          <button type="button" class="remove-image-btn" @click="removeImage(index)" title="Remove image">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M12 4l-8 8M4 4l8 8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+      </div>
       <div v-if="selectedFile" class="file-preview">
         <span class="file-name">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" class="file-icon">
@@ -190,8 +211,9 @@
         <textarea
           v-model="draft"
           :disabled="loadingChat || !activeProject"
-          :placeholder="activeProject ? 'Ask about schemas, generate SQL, or request ER diagrams...' : 'Select a project to start chatting...'"
+          :placeholder="activeProject ? 'Ask about schemas, generate SQL, or request ER diagrams... (Paste images to analyze)' : 'Select a project to start chatting...'"
           @keydown.enter="handleEnterKey"
+          @paste="handlePaste"
         ></textarea>
         <div class="composer-actions">
           <input
@@ -253,6 +275,7 @@ const transcriptContainer = ref<HTMLElement | null>(null);
 // File Upload State
 const selectedFile = ref<File | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
+const pastedImages = ref<Array<{ data: string; name: string }>>([])
 
 const colorPalette = [
   "#3b82f6", // blue
@@ -280,6 +303,33 @@ function triggerFileSelect() {
 
 function removeFile() {
   selectedFile.value = null;
+}
+
+async function handlePaste(event: ClipboardEvent) {
+  const items = event.clipboardData?.items;
+  if (!items) return;
+
+  for (const item of Array.from(items)) {
+    if (item.type.startsWith('image/')) {
+      event.preventDefault();
+      const file = item.getAsFile();
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const base64 = e.target?.result as string;
+          pastedImages.value.push({
+            data: base64,
+            name: `pasted-image-${Date.now()}.${item.type.split('/')[1]}`
+          });
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  }
+}
+
+function removeImage(index: number) {
+  pastedImages.value.splice(index, 1);
 }
 
 interface MessageBlock {
@@ -326,8 +376,9 @@ function parseMessage(text: string): MessageBlock[] {
   const sqlPattern = /```sql\n([\s\S]*?)```/g;
   // Match chart JSON blocks (```chart ... ``` or CHART: {...})
   const chartPattern = /```chart\n([\s\S]*?)```|CHART:\s*(\{[\s\S]*?\})/g;
-  // Match table-like structures (lines with | separators)
-  const tablePattern = /(?:^|\n)((?:\|[^\n]+\|\n?)+)/g;
+  // Match table-like structures - properly match consecutive lines with pipes
+  // This regex matches one or more consecutive lines that contain pipes
+  const tablePattern = /((?:^|\n)(?:[^\n]*\|[^\n]*\n?)+)/gm;
 
   const matches: Array<{ type: "sql" | "table" | "chart"; start: number; end: number; match: RegExpMatchArray }> = [];
 
@@ -436,16 +487,19 @@ function parseMessage(text: string): MessageBlock[] {
 }
 
 function parseTable(tableText: string): MessageBlock | null {
+  // Filter out lines that are just borders (start with +) unless they contain |
   const lines = tableText.trim().split("\n").filter(line => line.includes("|"));
+  
   if (lines.length < 2) return null;
 
   const rows = lines.map(line => 
     line.split("|")
       .map(cell => cell.trim())
-      .filter(cell => cell.length > 0)
+      .filter(cell => cell.length > 0) // Remove empty cells from split
   );
 
   // Check if second line is a separator (contains mostly - and |)
+  // Note: rows[1] is the parsed cells of the second line
   const isSeparatorLine = (line: string[]) => 
     line.every(cell => /^[-:|\s]+$/.test(cell));
 
@@ -456,7 +510,13 @@ function parseTable(tableText: string): MessageBlock | null {
       headers: rows[0],
       rows: rows.slice(2),
     };
-  } else if (rows.length >= 1) {
+  } 
+  
+  // For loose tables (no separator), check column consistency to avoid false positives
+  const colCounts = rows.map(r => r.length);
+  const isConsistent = new Set(colCounts).size === 1;
+
+  if (rows.length >= 1 && isConsistent) {
     // Simple table without separator
     return {
       type: "table",
@@ -466,6 +526,44 @@ function parseTable(tableText: string): MessageBlock | null {
   }
 
   return null;
+}
+
+function exportTableToCsv(block: MessageBlock): void {
+  if (block.type !== "table" || !block.headers || !block.rows) {
+    return;
+  }
+
+  const csvEscape = (value: unknown): string => {
+    const text = value === null || value === undefined ? "" : String(value);
+    if (/[",\n\r]/.test(text)) {
+      return `"${text.replace(/"/g, '""')}"`;
+    }
+    return text;
+  };
+
+  const lines: string[] = [];
+  lines.push(block.headers.map(csvEscape).join(","));
+  for (const row of block.rows) {
+    lines.push(row.map(csvEscape).join(","));
+  }
+
+  const csv = lines.join("\r\n") + "\r\n";
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
+  const date = new Date();
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  const filename = `query_results_${yyyy}-${mm}-${dd}.csv`;
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function escapeHtml(text: string): string {
@@ -588,6 +686,30 @@ function clearChat(): void {
   expandedSqlBlocks.value.clear();
 }
 
+function formatTimestamp(timestamp: number): string {
+  if (!timestamp) return '';
+  const date = new Date(timestamp * 1000);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  
+  const timeStr = date.toLocaleTimeString('en-US', { 
+    hour: '2-digit', 
+    minute: '2-digit',
+    hour12: false 
+  });
+  
+  if (messageDate.getTime() === today.getTime()) {
+    return timeStr;
+  } else {
+    const dateStr = date.toLocaleDateString('en-US', { 
+      month: 'short', 
+      day: 'numeric' 
+    });
+    return `${dateStr} ${timeStr}`;
+  }
+}
+
 function openHistory() {
     historyVisible.value = true;
     loadHistory();
@@ -624,16 +746,18 @@ async function send(): Promise<void> {
     errorMessage.value = "Please select a project first.";
     return;
   }
-  if (!draft.value.trim() && !selectedFile.value) {
-    errorMessage.value = "Enter a question or attach a file.";
+  if (!draft.value.trim() && !selectedFile.value && pastedImages.value.length === 0) {
+    errorMessage.value = "Enter a question, attach a file, or paste an image.";
     return;
   }
   errorMessage.value = "";
   const content = draft.value;
   const file = selectedFile.value;
+  const images = [...pastedImages.value];
   
   draft.value = "";
   selectedFile.value = null;
+  pastedImages.value = [];
   
   try {
     let fileData = undefined;
@@ -658,11 +782,12 @@ async function send(): Promise<void> {
       fileData = { name: file.name, content };
     }
     
-    await sessionStore.sendMessage(content, fileData);
+    await sessionStore.sendMessage(content, fileData, images.length > 0 ? images : undefined);
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : "Chat request failed.";
     draft.value = content;
     selectedFile.value = file; // Restore file on error
+    pastedImages.value = images; // Restore images on error
   }
 }
 
@@ -1230,13 +1355,24 @@ onUpdated(() => {
   background-color: #e2e8f0;
 }
 
+.message-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
 .label {
-  display: block;
   font-weight: 600;
   font-size: 0.75rem;
   color: #1e3a8a;
-  margin-bottom: 0.25rem;
   text-transform: uppercase;
+}
+
+.timestamp {
+  font-size: 0.7rem;
+  color: #64748b;
+  margin-left: auto;
 }
 
 .message-content {
@@ -1290,6 +1426,39 @@ onUpdated(() => {
   overflow-x: auto;
   border-radius: 6px;
   border: 1px solid #cbd5e1;
+}
+
+.table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  padding: 0 0.25rem;
+}
+
+.table-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #475569;
+}
+
+.export-csv-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: transparent;
+  color: #10b981;
+  border: 1px solid #10b981;
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.export-csv-btn:hover {
+  background: #10b981;
+  color: white;
 }
 
 .data-table {
@@ -1484,6 +1653,50 @@ onUpdated(() => {
   font-size: 0.85rem;
   color: #334155;
   border: 1px solid #e2e8f0;
+}
+
+.pasted-images {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+
+.image-preview {
+  position: relative;
+  width: 120px;
+  height: 120px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 2px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+.image-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.remove-image-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  border: none;
+  color: white;
+  cursor: pointer;
+  padding: 0.3rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: all 0.2s;
+}
+
+.remove-image-btn:hover {
+  background: rgba(239, 68, 68, 0.9);
+  transform: scale(1.1);
 }
 
 .file-name {

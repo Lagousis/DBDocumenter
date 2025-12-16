@@ -22,15 +22,23 @@
           <p v-else-if="!queries.length" class="status">No queries saved yet.</p>
           <ul v-else class="query-list">
             <li v-for="query in queries" :key="query.id" class="query-card">
-              <div class="query-card__info">
-                <h4>{{ query.name || "Untitled query" }}</h4>
+              <div class="query-card__header">
+                <div class="query-card__title-group">
+                  <h4>{{ query.name || "Untitled query" }}</h4>
+                  <span v-if="query.updated_at" class="meta date">Updated: {{ formatDate(query.updated_at) }}</span>
+                </div>
+                <div class="query-card__actions">
+                  <button type="button" class="primary-button" @click="emitSelect(query.id)">Open</button>
+                  <button type="button" class="secondary-button" @click="handleEdit(query)">Edit</button>
+                  <button type="button" class="link-button" @click="emitDelete(query.id)">Delete</button>
+                </div>
+              </div>
+              <div class="query-card__content">
                 <p>{{ query.description || "No description provided." }}</p>
                 <pre>{{ query.sql }}</pre>
-                <span class="meta">{{ query.limit ? `Limit ${query.limit}` : "No limit saved" }}</span>
-              </div>
-              <div class="query-card__actions">
-                <button type="button" class="primary-button" @click="emitSelect(query.id)">Open</button>
-                <button type="button" class="link-button" @click="emitDelete(query.id)">Delete</button>
+                <div class="meta-row">
+                  <span class="meta">{{ query.limit ? `Limit ${query.limit}` : "No limit saved" }}</span>
+                </div>
               </div>
             </li>
           </ul>
@@ -38,10 +46,22 @@
       </div>
     </div>
   </transition>
+
+  <QuerySaveDialog
+    :visible="showEditDialog"
+    :loading="editLoading"
+    :error="editError"
+    :default-name="editingQuery?.name"
+    :default-description="editingQuery?.description || ''"
+    @close="closeEditDialog"
+    @submit="handleSaveEdit"
+  />
 </template>
 
 <script setup lang="ts">
+import { ref } from "vue";
 import type { QueryRecord } from "../types/api";
+import QuerySaveDialog from "./QuerySaveDialog.vue";
 
 interface Props {
   visible: boolean;
@@ -56,7 +76,13 @@ const emit = defineEmits<{
   (e: "refresh"): void;
   (e: "select", id: string): void;
   (e: "delete", id: string): void;
+  (e: "update", payload: { id: string; name: string; description: string }): void;
 }>();
+
+const showEditDialog = ref(false);
+const editingQuery = ref<QueryRecord | null>(null);
+const editLoading = ref(false);
+const editError = ref("");
 
 function emitClose(): void {
   emit("close");
@@ -72,6 +98,37 @@ function emitSelect(id: string): void {
 
 function emitDelete(id: string): void {
   emit("delete", id);
+}
+
+function handleEdit(query: QueryRecord): void {
+  editingQuery.value = query;
+  editError.value = "";
+  showEditDialog.value = true;
+}
+
+function closeEditDialog(): void {
+  showEditDialog.value = false;
+  editingQuery.value = null;
+}
+
+function handleSaveEdit(payload: { name: string; description: string }): void {
+  if (!editingQuery.value) return;
+  
+  emit("update", {
+    id: editingQuery.value.id,
+    name: payload.name,
+    description: payload.description
+  });
+  
+  closeEditDialog();
+}
+
+function formatDate(isoString: string): string {
+  try {
+    return new Date(isoString).toLocaleString();
+  } catch (e) {
+    return isoString;
+  }
 }
 </script>
 
@@ -144,27 +201,40 @@ function emitDelete(id: string): void {
 
 .query-card {
   display: flex;
-  justify-content: space-between;
-  gap: 0.75rem;
+  flex-direction: column;
+  gap: 0.5rem;
   border: 1px solid rgba(178, 106, 69, 0.18);
   border-radius: 14px;
   padding: 0.85rem 1rem;
   background: rgba(255, 255, 255, 0.85);
 }
 
-.query-card__info h4 {
+.query-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.query-card__title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.query-card__title-group h4 {
   margin: 0;
   color: #4f4035;
   font-size: 1rem;
 }
 
-.query-card__info p {
+.query-card__content p {
   margin: 0.35rem 0 0.4rem;
   color: #7a6a5d;
   font-size: 0.88rem;
 }
 
-.query-card__info pre {
+.query-card__content pre {
   margin: 0.25rem 0;
   padding: 0.5rem;
   background: #f8fafc;
@@ -183,40 +253,67 @@ function emitDelete(id: string): void {
 
 .query-card__actions {
   display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  align-items: flex-end;
+  flex-direction: row;
+  gap: 0.5rem;
+  align-items: center;
 }
 
 .primary-button {
   border: none;
-  border-radius: 10px;
-  padding: 0.45rem 1rem;
-  background: linear-gradient(135deg, #2563eb, #38bdf8);
+  border-radius: 6px;
+  padding: 0.35rem 0.85rem;
+  background: #007bff;
   color: #ffffff;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  font-size: 0.85rem;
 }
 
 .primary-button:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 8px 18px rgba(59, 130, 246, 0.28);
+  background: #0056b3;
+}
+
+.secondary-button {
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  padding: 0.35rem 0.85rem;
+  background: #fff;
+  color: #333;
+  font-weight: 500;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.secondary-button:hover {
+  background: #f8f9fa;
+  border-color: #bbb;
 }
 
 .link-button {
   border: none;
   background: transparent;
-  color: #b91c1c;
-  font-weight: 600;
+  color: #dc3545;
+  font-weight: 500;
   cursor: pointer;
   font-size: 0.85rem;
-  padding: 0.2rem 0.4rem;
-  border-radius: 999px;
+  padding: 0.35rem 0.85rem;
 }
 
 .link-button:hover {
-  background: rgba(185, 28, 28, 0.08);
+  text-decoration: underline;
+}
+
+.meta-row {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-top: 0.25rem;
+}
+
+.date {
+  color: #6c757d;
+  font-weight: normal;
+  font-size: 0.75rem;
 }
 
 .status {

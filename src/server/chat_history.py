@@ -34,10 +34,13 @@ class ChatHistoryManager:
             description = existing_session.description
             final_session_id = existing_session.id
 
-            # Update description every 6 messages (approx 3 turns) or if it's the default
+            # Count user messages to determine when to update the title
+            user_msg_count = sum(1 for m in messages if m.role == "user")
+
+            # Update description every 5 user messages or if it's the default
             # We check if we added enough new messages to warrant a re-summary
             if len(messages) > len(existing_session.messages) and (
-                len(messages) % 6 == 0 or description == "Chat Session"
+                (user_msg_count > 0 and user_msg_count % 5 == 0) or description == "Chat Session"
             ):
                 description = self._generate_description(messages)
         else:
@@ -117,11 +120,45 @@ class ChatHistoryManager:
         if not messages:
             return "Empty chat"
 
+        def get_fallback_title() -> str:
+            for msg in messages:
+                if msg.role == "user" and msg.content:
+                    content = str(msg.content).strip()
+                    # Handle JSON content (multimodal)
+                    if content.startswith("[") and content.endswith("]"):
+                        try:
+                            import json
+                            data = json.loads(content)
+                            if isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        content = item.get("text", "")
+                                        break
+                        except Exception:
+                            pass
+                    
+                    # Clean up content
+                    content = content.replace("\n", " ").strip()
+                    
+                    if len(content) > 40:
+                        return content[:40].rsplit(' ', 1)[0] + "..."
+                    return content or "Chat Session"
+            return "Chat Session"
+
         # Filter out system messages and tool outputs for the summary
+        # Use first 3 messages to establish context, and last 10 to capture recent context
+        # This allows the title to evolve as the conversation progresses
+        content_messages = [m for m in messages if m.role in ["user", "assistant"]]
+        
+        if len(content_messages) <= 15:
+            relevant_messages = content_messages
+        else:
+            relevant_messages = content_messages[:3] + content_messages[-10:]
+
         conversation_text = ""
-        for msg in messages[:10]:  # Use first 10 messages for context
-            if msg.role in ["user", "assistant"]:
-                conversation_text += f"{msg.role}: {msg.content}\n"
+        for msg in relevant_messages:
+            content = msg.content or ""
+            conversation_text += f"{msg.role}: {content}\n"
 
         if not conversation_text:
             return "No conversation content"
@@ -133,7 +170,7 @@ class ChatHistoryManager:
             api_key = os.environ.get("AZURE_OPENAI_API_KEY")
             if not api_key:
                 print("DEBUG: AZURE_OPENAI_API_KEY not found in environment.")
-                return "Chat Session"
+                return get_fallback_title()
 
             deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5")
             api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
@@ -159,7 +196,7 @@ class ChatHistoryManager:
                         "content": (
                             "Generate a short, descriptive title (3-6 words) for this conversation. "
                             "Focus on the user's intent (e.g., 'Sales Analysis', 'Customer Query', 'Schema Update'). "
-                            "Do not use quotes."
+                            "Do not use quotes. Do not include prefixes like 'Title:' or 'Conversation title:'."
                         )
                     },
                     {"role": "user", "content": conversation_text}
@@ -175,7 +212,7 @@ class ChatHistoryManager:
 
             if content:
                 return content.strip().strip('"')
-            return "Chat Session"
+            return get_fallback_title()
         except Exception as e:
             print(f"Error generating summary: {e}")
-            return "Chat Session"
+            return get_fallback_title()

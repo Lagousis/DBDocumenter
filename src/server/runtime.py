@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from types import GeneratorType
@@ -486,6 +487,7 @@ class DuckDBRuntime:
         relationships: Optional[List[Dict[str, Any]]],
         new_field_name: Optional[str],
         allow_null: Optional[bool],
+        ignored: Optional[bool] = None,
     ) -> Dict[str, Any]:
         async with self._query_lock:
             resolved = await self._ensure_project_locked(project=project, database=database)
@@ -505,6 +507,7 @@ class DuckDBRuntime:
                 nullability=nullability_text,
                 data_type=data_type,
                 values=values,
+                ignored=ignored,
             )
             updated_field_name = field
             if new_field_name and new_field_name.strip() and new_field_name.strip() != field:
@@ -746,25 +749,25 @@ class DuckDBRuntime:
 
         try:
             response = await asyncio.to_thread(agent.run, prompt, reset=False)
-            result_text = self._materialize_agent_response(response).strip()
+            text_response = self._materialize_agent_response(response).strip()
 
             # Parse the response
             short_desc = ""
             long_desc = ""
-            data_type = ""
-            nullable = not has_nulls  # Default based on actual data
+            data_type = "VARCHAR"
+            nullable = True
 
-            for line in result_text.split("\n"):
+            for line in text_response.split('\n'):
                 line = line.strip()
                 if line.startswith("SHORT:"):
                     short_desc = line[6:].strip()
                 elif line.startswith("LONG:"):
                     long_desc = line[5:].strip()
                 elif line.startswith("TYPE:"):
-                    data_type = line[5:].strip().upper()
+                    data_type = line[5:].strip()
                 elif line.startswith("NULLABLE:"):
-                    nullable_str = line[9:].strip().lower()
-                    nullable = nullable_str in ['true', 'yes', '1']
+                    val = line[9:].strip().lower()
+                    nullable = val == 'true'
 
             return AIAssistFieldResponse(
                 short_description=short_desc,
@@ -883,8 +886,8 @@ class DuckDBRuntime:
 
                     content = msg.get("content") or ""
 
-                    # Strip context from user messages
-                    if msg.get("role") == "user" and content.startswith("[Context:"):
+                    # Strip context from user messages (only if content is a string)
+                    if msg.get("role") == "user" and isinstance(content, str) and content.startswith("[Context:"):
                         # Find the end of the context block
                         context_end = content.find("]\n\n")
                         if context_end != -1:
@@ -893,9 +896,15 @@ class DuckDBRuntime:
                             # Fallback for different formatting
                             content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
 
+                    # For multimodal messages (list content), convert to JSON string for storage
+                    if isinstance(content, list):
+                        import json
+                        content = json.dumps(content)
+
                     messages.append(ChatMessage(
                         role=str(msg.get("role") or "user"),
                         content=content,
+                        timestamp=time.time(),
                         tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
                         tool_call_id=msg.get("tool_call_id")
                     ))
@@ -920,6 +929,7 @@ class DuckDBRuntime:
         file_content: Optional[str] = None,
         filename: Optional[str] = None,
         session_id: Optional[str] = None,
+        images: Optional[List[Dict[str, str]]] = None,
     ):
         """Stream chat responses as they are generated."""
         print(f"DEBUG: run_chat_stream called with message={message}, project={project}")
@@ -955,24 +965,106 @@ class DuckDBRuntime:
             if active_db:
                 project_name = Path(active_db).stem
                 db_filename = Path(active_db).name
+
+                # Get query instructions
+                query_instructions = ""
+                try:
+                    # Access schema manager from the tool attached to the agent
+                    tool = getattr(agent, "duckdb_tool", None)
+                    if tool and hasattr(tool, "schema_manager"):
+                        meta = tool.schema_manager.get_project_metadata()
+                        query_instructions = meta.get("query_instructions", "")
+                except Exception:
+                    pass
+
+                instructions_text = ""
+                if query_instructions:
+                    instructions_text = f"\n[Project Instructions: {query_instructions}]\n"
+
                 enhanced_message = (
                     f"[Context: You are currently working with the '{project_name}' DuckDB project. "
                     f"The database '{db_filename}' is already selected and active. "
-                    f"You do not need to specify database or project parameters in tool calls.]\n\n"
+                    f"You do not need to specify database or project parameters in tool calls.]{instructions_text}\n\n"
                     f"{enhanced_message}"
                 )
             else:
                 enhanced_message = message
 
             try:
+                # Setup queue for streaming status updates
+                status_queue = asyncio.Queue()
+                loop = asyncio.get_running_loop()
+
+                def on_step_callback(msg: str):
+                    loop.call_soon_threadsafe(status_queue.put_nowait, {"type": "status", "message": msg})
+
                 # Run agent in thread and capture response with timeout
                 print("DEBUG: calling agent.run in thread")
                 # Allow enough time for multiple steps with the configured timeout
-                execution_timeout = max(120.0, self.settings.agent_timeout * 3)
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(agent.run, enhanced_message, reset=reset),
-                    timeout=execution_timeout
+                # Increased to 300s to handle potential rate limit retries
+                execution_timeout = max(300.0, self.settings.agent_timeout * 5)
+
+                agent_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        agent.run,
+                        enhanced_message,
+                        reset=reset,
+                        images=images,
+                        on_step=on_step_callback
+                    )
                 )
+
+                # Poll queue while agent is running
+                queue_task = asyncio.create_task(status_queue.get())
+
+                while not agent_task.done():
+                    try:
+                        done, pending = await asyncio.wait(
+                            [queue_task, agent_task],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+
+                        if queue_task in done:
+                            item = queue_task.result()
+                            yield item
+                            # Create new task for next item
+                            queue_task = asyncio.create_task(status_queue.get())
+
+                        # If agent_task is done, the loop condition will handle it
+                    except Exception:
+                        pass
+
+                # Cancel the pending queue wait
+                if not queue_task.done():
+                    queue_task.cancel()
+                    try:
+                        await queue_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Process any remaining items in queue (that might have been put just before agent finished)
+                while not status_queue.empty():
+                    yield await status_queue.get()
+
+                # Get the final result (or raise exception if failed)
+                try:
+                    response = await agent_task
+                except Exception as e:
+                    # Check if this is an invalid request error due to incomplete tool calls
+                    error_str = str(e).lower()
+                    if "toolcalls" in error_str or "tool_calls" in error_str or "invalidrequest" in error_str:
+                        print(f"DEBUG: Detected corrupted conversation state, resetting: {e}")
+                        # Reset the conversation and retry
+                        # Note: We don't stream status for the retry to keep it simple for now
+                        response = await asyncio.wait_for(
+                            asyncio.to_thread(agent.run, enhanced_message, reset=True, images=images),
+                            timeout=execution_timeout
+                        )
+                        print("DEBUG: Successfully recovered from corrupted state")
+                    else:
+                        # Re-raise other exceptions
+                        raise
+
                 print(f"DEBUG: agent.run completed, response type={type(response)}")
                 reply_text = self._materialize_agent_response(response)
                 print(f"DEBUG: materialized response, length={len(reply_text)}")
@@ -989,17 +1081,23 @@ class DuckDBRuntime:
 
                         content = msg.get("content") or ""
 
-                        # Strip context from user messages
-                        if msg.get("role") == "user" and content.startswith("[Context:"):
+                        # Strip context from user messages (only if content is a string)
+                        if msg.get("role") == "user" and isinstance(content, str) and content.startswith("[Context:"):
                             context_end = content.find("]\n\n")
                             if context_end != -1:
                                 content = content[context_end + 3:]
                             else:
                                 content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
 
+                        # For multimodal messages (list content), convert to JSON string for storage
+                        if isinstance(content, list):
+                            import json
+                            content = json.dumps(content)
+
                         messages.append(ChatMessage(
                             role=str(msg.get("role") or "user"),
                             content=content,
+                            timestamp=time.time(),
                             tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
                             tool_call_id=msg.get("tool_call_id")
                         ))
@@ -1043,15 +1141,20 @@ class DuckDBRuntime:
                             if msg.get("role") == "system":
                                 continue
                             content = msg.get("content") or ""
-                            if msg.get("role") == "user" and content.startswith("[Context:"):
+                            is_user_msg = msg.get("role") == "user"
+                            if is_user_msg and isinstance(content, str) and content.startswith("[Context:"):
                                 context_end = content.find("]\n\n")
                                 if context_end != -1:
                                     content = content[context_end + 3:]
                                 else:
                                     content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
+                            if isinstance(content, list):
+                                import json
+                                content = json.dumps(content)
                             messages.append(ChatMessage(
                                 role=str(msg.get("role") or "user"),
                                 content=content,
+                                timestamp=time.time(),
                                 tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
                                 tool_call_id=msg.get("tool_call_id")
                             ))
@@ -1089,15 +1192,20 @@ class DuckDBRuntime:
                             if msg.get("role") == "system":
                                 continue
                             content = msg.get("content") or ""
-                            if msg.get("role") == "user" and content.startswith("[Context:"):
+                            is_user_msg = msg.get("role") == "user"
+                            if is_user_msg and isinstance(content, str) and content.startswith("[Context:"):
                                 context_end = content.find("]\n\n")
                                 if context_end != -1:
                                     content = content[context_end + 3:]
                                 else:
                                     content = re.sub(r"^\[Context:.*?\]\n\n", "", content, flags=re.DOTALL)
+                            if isinstance(content, list):
+                                import json
+                                content = json.dumps(content)
                             messages.append(ChatMessage(
                                 role=str(msg.get("role") or "user"),
                                 content=content,
+                                timestamp=time.time(),
                                 tool_calls=self._serialize_tool_calls(msg.get("tool_calls")),
                                 tool_call_id=msg.get("tool_call_id")
                             ))
@@ -1131,8 +1239,7 @@ class DuckDBRuntime:
                 "Please fix the query or implement the logic described in the comments.\n"
                 "Use DuckDB-specific syntax and functions where appropriate.\n"
                 "Return the valid SQL query. You MUST preserve the original comments in the output, "
-                "placing them above the corresponding SQL code.\n"
-                "Do not include markdown formatting (like ```sql ... ```) or explanations.\n\n"
+                "placing them above the corresponding SQL code.\n\n"
                 f"Query:\n{sql}"
             )
 
@@ -1154,6 +1261,59 @@ class DuckDBRuntime:
             result = re.sub(r"\s*```$", "", result)
 
             return result.strip()
+
+    async def assist_query_error(
+        self,
+        *,
+        sql: str,
+        error: str,
+        project: Optional[str] = None,
+        database: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """
+        Use the AI agent to explain and fix a SQL error.
+        """
+        agent = await self._ensure_agent()
+        async with self._agent_run_lock:
+            active_db = self._set_agent_project(agent, project=project, database=database)
+
+            prompt = (
+                "You are an expert DuckDB SQL assistant. "
+                "The user tried to execute a SQL query but encountered an error.\n"
+                "Please explain why the error occurred and provide a corrected SQL query.\n"
+                "Use DuckDB-specific syntax and functions where appropriate.\n"
+                "Return the result as a JSON object with two keys:\n"
+                "1. 'explanation': A concise explanation of the error and the fix.\n"
+                "2. 'fixed_sql': The corrected SQL query.\n"
+                "Do not include markdown formatting around the JSON.\n\n"
+                f"Query:\n{sql}\n\n"
+                f"Error:\n{error}"
+            )
+
+            # Prepend project context if available
+            if active_db:
+                project_name = Path(active_db).stem
+                prompt = (
+                    f"[Context: You are working with the '{project_name}' DuckDB project.]\n"
+                    f"{prompt}"
+                )
+
+            response = await asyncio.to_thread(agent.run, prompt, reset=False)
+            result_text = self._materialize_agent_response(response).strip()
+
+            # Clean up markdown code blocks if present
+            result_text = re.sub(r"^```json\s*", "", result_text)
+            result_text = re.sub(r"^```\s*", "", result_text)
+            result_text = re.sub(r"\s*```$", "", result_text)
+
+            try:
+                return json.loads(result_text)
+            except json.JSONDecodeError:
+                # Fallback if LLM didn't return valid JSON
+                return {
+                    "explanation": "The AI assistant provided a response but it wasn't in the expected format.",
+                    "fixed_sql": result_text
+                }
 
     def _materialize_agent_response(self, response: Any) -> str:
         if response is None:
@@ -1230,6 +1390,9 @@ class DuckDBRuntime:
             display_name = str(payload.get("project_display_name") or payload.get("project") or path.stem)
             description = str(payload.get("project_description") or "")
             version = payload.get("version")
+            query_instructions = str(payload.get("query_instructions") or "")
+        else:
+            query_instructions = ""
 
         return {
             "name": unique_name,
@@ -1238,6 +1401,7 @@ class DuckDBRuntime:
             "subdirectory": subdirectory,
             "description": description,
             "version": version,
+            "query_instructions": query_instructions,
         }
 
     def _slugify(self, value: str) -> str:
@@ -1251,6 +1415,7 @@ class DuckDBRuntime:
         display_name: Optional[str] = None,
         description: Optional[str] = None,
         version: Optional[str] = None,
+        query_instructions: Optional[str] = None,
     ) -> Dict[str, Any]:
         target = Path(path).expanduser().resolve()
         if not target.exists():
@@ -1266,6 +1431,9 @@ class DuckDBRuntime:
                 display_name=display_name if display_name is not None else current_meta["display_name"],
                 description=description if description is not None else current_meta["description"],
                 version=version if version is not None else current_meta.get("version"),
+                query_instructions=query_instructions
+                if query_instructions is not None
+                else current_meta.get("query_instructions"),
             )
 
             # Handle renaming if version changed
@@ -1313,7 +1481,9 @@ class DuckDBRuntime:
             info["is_active"] = bool(current and target == current)
             return info
 
-    async def create_project(self, *, name: str, description: Optional[str] = "") -> Dict[str, Any]:
+    async def create_project(
+        self, *, name: str, description: Optional[str] = "", query_instructions: Optional[str] = ""
+    ) -> Dict[str, Any]:
         trimmed = name.strip()
         if not trimmed:
             raise ValueError("Project name must not be empty.")
@@ -1336,7 +1506,9 @@ class DuckDBRuntime:
 
         manager = SchemaManager()
         manager.set_database(candidate)
-        manager.set_project_metadata(display_name=trimmed, description=description or "")
+        manager.set_project_metadata(
+            display_name=trimmed, description=description or "", query_instructions=query_instructions or ""
+        )
 
         info = self._project_metadata_from_path(candidate)
         info["is_active"] = False

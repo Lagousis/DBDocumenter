@@ -4,7 +4,16 @@ from collections.abc import Sequence as SequenceABC
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+    cast,
+)
 
 import duckdb
 
@@ -240,18 +249,32 @@ def _copy_single_object(
     print(f"- Copying into '{destination}'{action_note}...")
 
     params = _normalise_params(obj.get("params"), index)
-    df = _fetch_dataframe(index, str(query_text), params, synapse_conn)
-    df = _coerce_dataframe_types(df)
-
+    
+    escaped_destination = _quote_identifier(str(destination))
     temp_name = f"synapse_tmp_{index}"
-    duck_conn.register(temp_name, df)
+    
+    first_batch = True
+    total_rows = 0
+    
+    for df in _fetch_batches(index, str(query_text), params, synapse_conn):
+        df = _coerce_dataframe_types(df)
+        duck_conn.register(temp_name, df)
+        
+        try:
+            if first_batch:
+                duck_conn.execute(f"CREATE OR REPLACE TABLE {escaped_destination} AS SELECT * FROM {temp_name}")
+                first_batch = False
+            else:
+                duck_conn.execute(f"INSERT INTO {escaped_destination} SELECT * FROM {temp_name}")
+            
+            batch_rows = len(df)
+            total_rows += batch_rows
+            if batch_rows > 0:
+                print(f"  Copied {total_rows} rows...", end="\r", flush=True)
+        finally:
+            duck_conn.unregister(temp_name)
 
-    try:
-        escaped_destination = _quote_identifier(str(destination))
-        duck_conn.execute(f"CREATE OR REPLACE TABLE {escaped_destination} AS SELECT * FROM {temp_name}")
-    finally:
-        duck_conn.unregister(temp_name)
-    print(f"  Finished '{destination}'.")
+    print(f"  Finished '{destination}'. Total rows: {total_rows}")
 
 
 def _normalise_params(raw_params: object, index: int) -> Optional[tuple[Any, ...]]:
@@ -267,12 +290,13 @@ def _normalise_params(raw_params: object, index: int) -> Optional[tuple[Any, ...
     raise ValueError(f"'params' for item #{index} must be a mapping or sequence of values.")
 
 
-def _fetch_dataframe(
+def _fetch_batches(
     index: int,
     query: str,
     params: Optional[tuple[Any, ...]],
     synapse_conn: "pyodbc.Connection",  # type: ignore
-) -> "pd.DataFrame":  # type: ignore
+    batch_size: int = 10000,
+) -> Iterator["pd.DataFrame"]:  # type: ignore
     if pd is None:
         raise RuntimeError("pandas is unavailable while fetching data from Synapse.")
 
@@ -320,12 +344,17 @@ def _fetch_dataframe(
             )
 
         columns = [column[0] for column in cursor.description]
-        rows = cursor.fetchall()
+        
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            yield pd.DataFrame.from_records([], columns=columns)
+            return
+
+        while rows:
+            yield pd.DataFrame.from_records(rows, columns=columns)
+            rows = cursor.fetchmany(batch_size)
     finally:
         cursor.close()
-
-    assert pd is not None  # Satisfy type checkers; guarded above.
-    return pd.DataFrame.from_records(rows, columns=columns)
 
 
 def _raise_execution_error(

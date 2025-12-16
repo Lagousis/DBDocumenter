@@ -1,7 +1,10 @@
 <template>
   <div class="schema-sidebar">
     <div class="sidebar-header">
-      <h2 class="section-title">Schema</h2>
+      <h2 class="section-title">
+        Schema
+        <span v-if="tables.length" class="count-badge">({{ tables.length }} tables)</span>
+      </h2>
     </div>
 
     <p v-if="!hasSelection" class="empty-state">Select a project to browse its tables and documentation.</p>
@@ -47,7 +50,12 @@
 
       <div v-if="selectedDetails" class="table-details">
         <div class="table-header">
-          <h3>{{ selectedDetails.name }}</h3>
+          <h3>
+            {{ selectedDetails.name }}
+            <span class="coverage-chip" :class="getCoverageClass(documentationCoverage)" title="Documentation Coverage">
+              {{ documentationCoverage }}%
+            </span>
+          </h3>
           <div class="table-header-actions">
             <button
               type="button"
@@ -254,7 +262,23 @@
               </footer>
             </article>
           </div>
-          <p v-else class="empty-state subtle">No documented fields yet.</p>
+
+          <div v-if="ignoredFields.length > 0" class="undocumented">
+            <span class="undocumented-label">Ignored Fields</span>
+            <div class="undocumented-chips">
+              <button
+                v-for="field in ignoredFields"
+                :key="`ignored-${field.name}`"
+                type="button"
+                class="undocumented-chip ignored"
+                @click="openEditor(field.name, field.type)"
+              >
+                {{ field.name }}
+              </button>
+            </div>
+          </div>
+
+          <p v-if="fields.length === 0 && ignoredFields.length === 0" class="empty-state subtle">No documented fields yet.</p>
         </section>
       </div>
       <div v-else class="empty-state secondary">Select a table to view its fields.</div>
@@ -298,6 +322,7 @@ interface FieldMetadata {
   data_type?: string;
   values?: Record<string, string>;
   relationships?: RelationshipPayload[];
+  ignored?: boolean;
 }
 
 const sessionStore = useSessionStore();
@@ -335,6 +360,7 @@ const fields = computed(() => {
     long: meta?.long_description ?? "",
     type: meta?.data_type ?? "",
     nullability: meta?.nullability ?? "",
+    ignored: meta?.ignored ?? false,
     values: Object.keys(meta?.values ?? {}).length ? meta?.values : null,
     relationships: tableRelationships
       .filter((rel: Record<string, any>) => (rel.field ?? "").toLowerCase() === name.toLowerCase())
@@ -346,9 +372,30 @@ const fields = computed(() => {
 
   const needle = fieldSearchTerm.value.trim().toLowerCase();
   if (!needle) {
-    return allFields;
+    return allFields.filter(f => !f.ignored);
   }
-  return allFields.filter((field) => field.name.toLowerCase().includes(needle));
+  return allFields.filter((field) => !field.ignored && field.name.toLowerCase().includes(needle));
+});
+
+const ignoredFields = computed(() => {
+  const details = selectedDetails.value?.data;
+  if (!details || !details.fields) {
+    return [];
+  }
+  const allFields = Object.entries(details.fields as Record<string, any>).map(([name, meta]) => ({
+    name,
+    short: meta?.short_description ?? "",
+    long: meta?.long_description ?? "",
+    type: meta?.data_type ?? "",
+    nullability: meta?.nullability ?? "",
+    ignored: meta?.ignored ?? false,
+  }));
+
+  const needle = fieldSearchTerm.value.trim().toLowerCase();
+  if (!needle) {
+    return allFields.filter(f => f.ignored);
+  }
+  return allFields.filter((field) => field.ignored && field.name.toLowerCase().includes(needle));
 });
 
 const filteredUndocumentedFields = computed(() => {
@@ -367,8 +414,20 @@ const filteredTables = computed(() => {
   return tables.value.filter((item) => item.toLowerCase().includes(needle));
 });
 
+const documentationCoverage = computed(() => {
+  const details = selectedDetails.value?.data;
+  if (!details) return 0;
+
+  const documentedCount = Object.keys(details.fields || {}).length;
+  const undocumentedCount = undocumentedFields.value.length;
+  const totalCount = documentedCount + undocumentedCount;
+
+  if (totalCount === 0) return 0;
+  return Math.round((documentedCount / totalCount) * 100);
+});
+
 const schemaTables = computed(() => (sessionStore.schema?.tables as Record<string, any>) || {});
-const tableNames = computed(() => Object.keys(schemaTables.value || {}));
+const tableNames = computed(() => Object.keys(schemaTables.value || {}).sort());
 const fieldNames = computed(() => {
   const names = new Set<string>();
   Object.values(schemaTables.value).forEach((table: any) => {
@@ -416,7 +475,10 @@ const relationshipSuggestionsForEditor = computed(() => {
       }
     });
   }
-  return suggestions;
+  return suggestions.sort((a, b) => 
+    a.related_table.localeCompare(b.related_table) || 
+    a.related_field.localeCompare(b.related_field)
+  );
 });
 
 watch(
@@ -453,6 +515,12 @@ function resolveTableName(name?: string | null): string | undefined {
   const lower = name.toLowerCase();
   const match = tableNames.value.find((entry) => entry.toLowerCase() === lower);
   return match ?? name;
+}
+
+function getCoverageClass(percentage: number): string {
+  if (percentage >= 100) return "high";
+  if (percentage >= 50) return "medium";
+  return "low";
 }
 
 function selectTable(name: string | undefined) {
@@ -905,6 +973,12 @@ function generateQuery(includeAll: boolean) {
   box-shadow: 0 4px 12px rgba(178, 106, 69, 0.14);
 }
 
+.undocumented-chip.ignored {
+  background: rgba(240, 240, 240, 0.92);
+  color: #7a6a5d;
+  border-color: rgba(122, 106, 93, 0.3);
+}
+
 .icon-button {
   width: 34px;
   height: 34px;
@@ -1055,5 +1129,42 @@ function generateQuery(includeAll: boolean) {
   padding: 1rem;
   color: #6d5b4d;
   background: rgba(249, 246, 238, 0.8);
+}
+
+.count-badge {
+  font-size: 0.85rem;
+  color: #7a6a5d;
+  font-weight: normal;
+  margin-left: 0.5rem;
+  background-color: rgba(178, 106, 69, 0.1);
+  padding: 0.1rem 0.5rem;
+  border-radius: 12px;
+}
+
+.coverage-chip {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 12px;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+
+.coverage-chip.high {
+  background-color: rgba(34, 197, 94, 0.15);
+  color: #15803d;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.coverage-chip.medium {
+  background-color: rgba(234, 179, 8, 0.15);
+  color: #a16207;
+  border: 1px solid rgba(234, 179, 8, 0.3);
+}
+
+.coverage-chip.low {
+  background-color: rgba(239, 68, 68, 0.15);
+  color: #b91c1c;
+  border: 1px solid rgba(239, 68, 68, 0.3);
 }
 </style>

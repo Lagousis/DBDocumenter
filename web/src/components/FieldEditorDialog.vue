@@ -41,19 +41,30 @@
                 </small>
               </label>
               <label class="block">
-                <span class="label">Data type</span>
-                <div class="data-type-select">
-                  <select v-model="form.data_type">
-                    <option v-for="type in dataTypes" :key="type" :value="type || ''">
-                      {{ type || "Select data type" }}
-                    </option>
-                  </select>
-                  <svg class="data-type-select__icon" width="12" height="8" viewBox="0 0 12 8" fill="none">
-                    <path d="M10.5 1.5L6 6 1.5 1.5" stroke="#9A6432" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </div>
+                <span class="label">Ignore field</span>
+                <label class="switch">
+                  <input v-model="form.ignored" type="checkbox" />
+                  <span class="switch-slider" />
+                </label>
+                <small class="muted inline">
+                  {{ form.ignored ? "ignored" : "active" }}
+                </small>
               </label>
             </div>
+
+            <label class="block">
+              <span class="label">Data type</span>
+              <div class="data-type-select">
+                <select v-model="form.data_type">
+                  <option v-for="type in dataTypes" :key="type" :value="type || ''">
+                    {{ type || "Select data type" }}
+                  </option>
+                </select>
+                <svg class="data-type-select__icon" width="12" height="8" viewBox="0 0 12 8" fill="none">
+                  <path d="M10.5 1.5L6 6 1.5 1.5" stroke="#9A6432" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </div>
+            </label>
 
             <div class="block">
               <div class="label-row">
@@ -83,8 +94,50 @@
 
               <div v-if="form.relationships.length" class="relationship-list">
                 <div v-for="(rel, idx) in form.relationships" :key="idx" class="relationship-row">
-                  <input v-model="rel.related_table" placeholder="Related table" list="table-suggestions" />
-                  <input v-model="rel.related_field" placeholder="Related field" :list="'field-suggestions-' + idx" />
+                  <div class="input-wrapper">
+                    <input v-model="rel.related_table" placeholder="Related table" list="table-suggestions" />
+                    <button v-if="rel.related_table" type="button" class="clear-btn" @click="rel.related_table = ''" title="Clear table">×</button>
+                  </div>
+                  <div class="input-wrapper">
+                    <input v-model="rel.related_field" placeholder="Related field" :list="'field-suggestions-' + idx" />
+                    <button v-if="rel.related_field" type="button" class="clear-btn" @click="rel.related_field = ''" title="Clear field">×</button>
+                  </div>
+                  
+                  <button 
+                    type="button" 
+                    class="icon-button small" 
+                    title="Test relationship coverage"
+                    @click="verifyRelationship(idx)"
+                    :disabled="rel.verifying || !rel.related_table || !rel.related_field"
+                  >
+                    <span v-if="rel.verifying" class="spinner small"></span>
+                    <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M8.5 2h7" />
+                      <path d="M12 2v4" />
+                      <path d="M18.42 20.22 12 6 5.58 20.22a2.2 2.2 0 0 0 2 1.78h8.84a2.2 2.2 0 0 0 2-1.78Z" />
+                    </svg>
+                  </button>
+
+                  <button 
+                    v-if="rel.coverage !== undefined" 
+                    type="button"
+                    class="coverage-badge" 
+                    :class="[getCoverageClass(rel.coverage), { clickable: rel.coverage < 100 }]"
+                    :title="rel.coverage < 100 ? 'Click to see unmatched values' : 'Full coverage'"
+                    @click="showUnmatched(rel)"
+                    :disabled="rel.coverage === 100"
+                  >
+                    {{ rel.coverage }}%
+                  </button>
+
+                  <span 
+                    v-if="rel.error" 
+                    class="error-badge" 
+                    :title="rel.error"
+                  >
+                    {{ rel.error }}
+                  </span>
+
                   <button type="button" class="icon-button small" @click="removeRelationship(idx)" aria-label="Remove relationship">&times;</button>
                 </div>
               </div>
@@ -116,6 +169,17 @@
               </button>
             </div>
             
+            <div v-if="!loadingValues && (nullCount !== null || emptyCount !== null)" class="stats-row">
+              <div class="stat-item" v-if="nullCount !== null">
+                <span class="stat-label">NULLs:</span>
+                <span class="stat-value">{{ nullCount }}</span>
+              </div>
+              <div class="stat-item" v-if="emptyCount !== null">
+                <span class="stat-label">Empty:</span>
+                <span class="stat-value">{{ emptyCount }}</span>
+              </div>
+            </div>
+            
             <div v-if="loadingValues" class="loading-state">
               <span class="spinner"></span> Loading...
             </div>
@@ -125,14 +189,17 @@
             </div>
             
             <div v-else class="values-grid">
-              <div v-for="val in distinctValues" :key="val" class="value-item">
-                <span class="value-text" :title="val">{{ val }}</span>
+              <div v-for="item in distinctValues" :key="item.value" class="value-item">
+                <div class="value-content">
+                  <span class="value-text" :title="item.value">{{ item.value }}</span>
+                  <span class="value-count" title="Count">{{ item.count }}</span>
+                </div>
                 <button 
                   type="button" 
                   class="icon-button small add-btn" 
                   title="Add to allowed values"
-                  @click="addValueFromGrid(val)"
-                  :disabled="form.values.some(v => v.key === val)"
+                  @click="addValueFromGrid(item.value)"
+                  :disabled="form.values.some(v => v.key === item.value)"
                 >
                   +
                 </button>
@@ -160,6 +227,17 @@
       <datalist v-for="(rel, idx) in form.relationships" :key="idx" :id="'field-suggestions-' + idx">
         <option v-for="fieldName in getFieldsForTable(rel.related_table)" :key="fieldName" :value="fieldName" />
       </datalist>
+
+      <UnmatchedValuesDialog
+        :visible="showUnmatchedDialog"
+        :loading="unmatchedLoading"
+        :values="unmatchedValues"
+        :source-table="unmatchedSourceTable"
+        :source-field="unmatchedSourceField"
+        :target-table="unmatchedTargetTable"
+        :target-field="unmatchedTargetField"
+        @close="showUnmatchedDialog = false"
+      />
     </div>
   </transition>
 </template>
@@ -170,13 +248,18 @@ import { computed, reactive, ref, watch } from "vue";
 import { aiAssistField, deleteField, runQuery, updateFieldMetadata } from "../api/client";
 import { useSessionStore } from "../stores/session";
 import type { AIAssistFieldRequest, FieldUpdateRequest, RelationshipPayload } from "../types/api";
+import UnmatchedValuesDialog from "./UnmatchedValuesDialog.vue";
 
 interface ValuePair {
   key: string;
   value: string;
 }
 
-interface RelationshipForm extends RelationshipPayload {}
+interface RelationshipForm extends RelationshipPayload {
+  coverage?: number;
+  verifying?: boolean;
+  error?: string;
+}
 
 interface FieldMetadata {
   name?: string;
@@ -186,11 +269,17 @@ interface FieldMetadata {
   data_type?: string;
   values?: Record<string, string>;
   relationships?: RelationshipPayload[];
+  ignored?: boolean;
 }
 
 interface RelationshipSuggestion {
   related_table: string;
   related_field: string;
+}
+
+interface DistinctValue {
+  value: string;
+  count: number;
 }
 
 const props = defineProps<{
@@ -218,13 +307,24 @@ const sessionStore = useSessionStore();
     values: [] as ValuePair[],
     relationships: [] as RelationshipForm[],
   allow_null: true,
+  ignored: false,
 });
 
 const saving = ref(false);
 const generatingAI = ref(false);
 const showValuesPanel = ref(false);
-const distinctValues = ref<string[]>([]);
+const distinctValues = ref<DistinctValue[]>([]);
 const loadingValues = ref(false);
+const nullCount = ref<number | null>(null);
+const emptyCount = ref<number | null>(null);
+
+const showUnmatchedDialog = ref(false);
+const unmatchedValues = ref<{ value: string; count: number }[]>([]);
+const unmatchedLoading = ref(false);
+const unmatchedSourceTable = ref("");
+const unmatchedSourceField = ref("");
+const unmatchedTargetTable = ref("");
+const unmatchedTargetField = ref("");
 
 const relationshipSuggestions = computed(() => props.suggestions || []);
 
@@ -242,6 +342,115 @@ function getFieldsForTable(tableName: string): string[] {
     return [];
   }
   return Object.keys(table.fields).sort();
+}
+
+function getCoverageClass(coverage: number): string {
+  if (coverage >= 90) return 'coverage-high';
+  if (coverage >= 50) return 'coverage-medium';
+  return 'coverage-low';
+}
+
+async function verifyRelationship(idx: number) {
+  const rel = form.relationships[idx];
+  if (!rel.related_table || !rel.related_field) return;
+
+  rel.verifying = true;
+  rel.coverage = undefined;
+  rel.error = undefined;
+
+  const sourceTable = props.table;
+  const sourceField = props.field;
+  const targetTable = rel.related_table;
+  const targetField = rel.related_field;
+
+// Construct SQL to check coverage
+  // We want to know what % of total non-null/non-empty rows in source exist in target
+  // We cast both sides to VARCHAR to avoid type mismatch errors (e.g. BIGINT vs VARCHAR)
+  const sql = `
+    SELECT 
+      COUNT(*) as total_rows,
+      COUNT(CASE WHEN CAST("${sourceField}" AS VARCHAR) IN (
+        SELECT CAST("${targetField}" AS VARCHAR) FROM "${targetTable}" WHERE "${targetField}" IS NOT NULL
+      ) THEN 1 END) as matched_count
+    FROM "${sourceTable}"
+    WHERE "${sourceField}" IS NOT NULL AND CAST("${sourceField}" AS VARCHAR) != ''
+  `;  try {
+    const result = await runQuery({
+      sql,
+      project: sessionStore.activeProject,
+      database: sessionStore.activeDatabase
+    });
+
+    if (result.rows && result.rows.length > 0) {
+      const total = Number(result.rows[0][0]);
+      const matched = Number(result.rows[0][1]);
+      
+      if (total > 0) {
+        if (matched === total) {
+          rel.coverage = 100;
+        } else {
+          // Calculate percentage with 1 decimal place, ensuring we don't round up to 100
+          // if there are any mismatches (e.g. 99.99% should show as 99.9%)
+          const pct = (matched / total) * 100;
+          rel.coverage = Math.floor(pct * 10) / 10;
+        }
+      } else {
+        rel.coverage = 0;
+      }
+    }
+  } catch (e: any) {
+    console.error("Verification failed", e);
+    const errorMessage = e.response?.data?.detail || e.message || String(e);
+    if (errorMessage.includes("Binder Error: Cannot compare values")) {
+      rel.error = "Incompatible fields";
+    }
+  } finally {
+    rel.verifying = false;
+  }
+}
+
+async function showUnmatched(rel: RelationshipForm) {
+  if (!rel.related_table || !rel.related_field || rel.coverage === undefined || rel.coverage === 100) return;
+
+  unmatchedSourceTable.value = props.table;
+  unmatchedSourceField.value = props.field;
+  unmatchedTargetTable.value = rel.related_table;
+  unmatchedTargetField.value = rel.related_field;
+  unmatchedValues.value = [];
+  showUnmatchedDialog.value = true;
+  unmatchedLoading.value = true;
+
+  try {
+    const sql = `
+      SELECT "${props.field}", COUNT(*) as count
+      FROM "${props.table}"
+      WHERE "${props.field}" IS NOT NULL 
+        AND CAST("${props.field}" AS VARCHAR) != ''
+        AND CAST("${props.field}" AS VARCHAR) NOT IN (
+          SELECT CAST("${rel.related_field}" AS VARCHAR)
+          FROM "${rel.related_table}"
+          WHERE "${rel.related_field}" IS NOT NULL
+        )
+      GROUP BY "${props.field}"
+      ORDER BY count DESC
+      LIMIT 100
+    `;    const result = await runQuery({
+      sql,
+      project: sessionStore.activeProject,
+      database: sessionStore.activeDatabase
+    });
+
+    if (result.rows) {
+      unmatchedValues.value = result.rows.map(row => ({
+        value: String(row[0]),
+        count: Number(row[1])
+      }));
+    }
+  } catch (e) {
+    console.error("Failed to fetch unmatched values", e);
+  } finally {
+    unmatchedLoading.value = false;
+  }
 }
 
 const DATA_TYPES = [
@@ -296,6 +505,7 @@ watch(
           }))
         : [];
     form.allow_null = inferAllowNull(metadata?.nullability);
+    form.ignored = metadata?.ignored ?? false;
     
     // Reset values panel state when field changes
     showValuesPanel.value = false;
@@ -332,18 +542,50 @@ async function toggleValuesPanel() {
 async function fetchDistinctValues() {
   if (!props.table || !props.field) return;
   loadingValues.value = true;
+  nullCount.value = null;
+  emptyCount.value = null;
+
   try {
-    const sql = `SELECT DISTINCT "${props.field}" FROM "${props.table}" LIMIT 100`;
-    const response = await runQuery({
-      project: sessionStore.activeProject,
-      database: sessionStore.activeDatabase,
-      sql,
-    });
-    if (response.rows) {
-      distinctValues.value = response.rows.map((row) => String(row[0] ?? "NULL"));
+    const sqlDistinct = `
+      SELECT "${props.field}", COUNT(*) as count 
+      FROM "${props.table}" 
+      GROUP BY "${props.field}" 
+      ORDER BY count DESC 
+      LIMIT 100
+    `;
+    const sqlCounts = `
+      SELECT 
+        SUM(CASE WHEN "${props.field}" IS NULL THEN 1 ELSE 0 END) as null_count,
+        SUM(CASE WHEN CAST("${props.field}" AS VARCHAR) = '' THEN 1 ELSE 0 END) as empty_count
+      FROM "${props.table}"
+    `;
+
+    const [distinctRes, countsRes] = await Promise.all([
+      runQuery({
+        project: sessionStore.activeProject,
+        database: sessionStore.activeDatabase,
+        sql: sqlDistinct,
+      }),
+      runQuery({
+        project: sessionStore.activeProject,
+        database: sessionStore.activeDatabase,
+        sql: sqlCounts,
+      })
+    ]);
+
+    if (distinctRes.rows) {
+      distinctValues.value = distinctRes.rows.map((row) => ({
+        value: String(row[0] ?? "NULL"),
+        count: Number(row[1] ?? 0)
+      }));
+    }
+
+    if (countsRes.rows && countsRes.rows.length > 0) {
+      nullCount.value = Number(countsRes.rows[0][0]);
+      emptyCount.value = Number(countsRes.rows[0][1]);
     }
   } catch (e) {
-    console.error("Failed to fetch distinct values", e);
+    console.error("Failed to fetch values", e);
   } finally {
     loadingValues.value = false;
   }
@@ -415,6 +657,7 @@ async function handleSave() {
       related_field: rel.related_field,
       type: rel.type || undefined,
     })),
+    ignored: form.ignored,
   };
 
   try {
@@ -755,6 +998,72 @@ textarea {
   align-items: center;
 }
 
+.relationship-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto auto auto;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.coverage-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 4px;
+  min-width: 32px;
+  height: 24px;
+  border-style: solid;
+  border-width: 1px;
+  cursor: default;
+}
+
+.coverage-badge.clickable {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.coverage-badge.clickable:hover {
+  opacity: 0.8;
+}
+
+.coverage-high {
+  background-color: #d1fae5;
+  color: #065f46;
+  border: 1px solid #a7f3d0;
+}
+
+.coverage-medium {
+  background-color: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+.coverage-low {
+  background-color: #fee2e2;
+  color: #b91c1c;
+  border: 1px solid #fecaca;
+}
+
+.error-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 4px;
+  height: 24px;
+  border: 1px solid #fecaca;
+  background-color: #fee2e2;
+  color: #b91c1c;
+  cursor: help;
+}
+
 .muted {
   color: #8a7b6f;
   font-size: 0.85rem;
@@ -894,5 +1203,86 @@ textarea {
 
 .chip:hover {
   background: rgba(255, 255, 255, 0.98);
+}
+
+.stats-row {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  padding: 0.5rem;
+  background: rgba(178, 106, 69, 0.05);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.stat-item {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.stat-label {
+  color: #8a7b6f;
+  font-weight: 500;
+}
+
+.stat-value {
+  color: #4f4035;
+  font-weight: 600;
+  font-family: monospace;
+}
+
+.value-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 1;
+  min-width: 0;
+  gap: 0.5rem;
+}
+
+.value-count {
+  color: #8a7b6f;
+  font-size: 0.75rem;
+  background: rgba(178, 106, 69, 0.1);
+  padding: 1px 6px;
+  border-radius: 99px;
+  flex-shrink: 0;
+}
+
+.input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.input-wrapper input {
+  width: 100%;
+  padding-right: 24px;
+}
+
+.clear-btn {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: #8a7b6f;
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+}
+
+.clear-btn:hover {
+  color: #b26a45;
+  background-color: rgba(178, 106, 69, 0.1);
 }
 </style>

@@ -55,9 +55,9 @@
                     @click="selectSession(session.id)"
                   >
                     <td class="col-desc">
-                      <div class="desc-text">{{ session.description || "Untitled Session" }}</div>
+                      <div class="desc-text">{{ formatDescription(session.description) }}</div>
                     </td>
-                    <td class="col-date">{{ new Date(session.created_at * 1000).toLocaleDateString() }}</td>
+                    <td class="col-date">{{ formatDateTime(session.created_at) }}</td>
                     <td class="col-count">{{ session.message_count }}</td>
                     <td class="col-actions">
                       <button type="button" class="action-btn delete-btn" @click.stop="emitDelete(session.id)" title="Delete Session">
@@ -193,6 +193,23 @@ async function selectSession(id: string) {
     } finally {
         loadingPreview.value = false;
     }
+}
+
+function formatDescription(desc: string): string {
+    if (!desc) return "Untitled Session";
+    // Remove common prefixes that LLMs might add
+    return desc.replace(/^(Conversation title:|Chat title:|Title:)\s*/i, "").trim();
+}
+
+function formatDateTime(timestamp: number): string {
+    if (!timestamp) return "";
+    return new Date(timestamp * 1000).toLocaleString(undefined, {
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
 }
 
 function emitClose(): void {

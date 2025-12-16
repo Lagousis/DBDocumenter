@@ -69,7 +69,7 @@ interface DiagramTabState {
   primaryTable: string;
   tables: string[];
   selectedTables?: string[];
-  layout?: Record<string, { x: number; y: number }>;
+  layout?: Record<string, { x: number; y: number; width?: number }>;
   diagramId?: string;
   diagramDescription?: string;
   hasUnsavedChanges?: boolean;
@@ -127,9 +127,22 @@ const SQL_PLACEHOLDER = "SELECT 1;";
 const STORAGE_SELECTED_TABLE_KEY = "schemaSelectedTable";
 const STORAGE_CHAT_PANEL_KEY = "chatPanelCollapsed";
 const STORAGE_CHAT_WIDTH_KEY = "chatPanelWidth";
+const STORAGE_QUERY_EDITOR_HEIGHT_KEY = "queryEditorHeight";
 
 function makeId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function loadQueryEditorHeight(): number {
+  if (typeof window === "undefined") {
+    return 200;
+  }
+  const stored = window.localStorage.getItem(STORAGE_QUERY_EDITOR_HEIGHT_KEY);
+  const parsed = stored ? Number.parseInt(stored, 10) : NaN;
+  if (Number.isFinite(parsed) && parsed >= 100 && parsed <= 800) {
+    return parsed;
+  }
+  return 200;
 }
 
 function loadSchemaWidth(): number {
@@ -176,6 +189,7 @@ export const useSessionStore = defineStore("session", {
     isChatCollapsed: loadChatCollapsed(),
     schemaPanelWidth: loadSchemaWidth(),
     chatPanelWidth: loadChatWidth(),
+    queryEditorHeight: loadQueryEditorHeight(),
     lastExpandedSchemaWidth: undefined as number | undefined,
     lastExpandedChatWidth: undefined as number | undefined,
     workspaceTabs: [] as WorkspaceTab[],
@@ -190,6 +204,7 @@ export const useSessionStore = defineStore("session", {
     projectDialogInitialName: "",
     projectDialogInitialDescription: "",
     projectDialogInitialVersion: "",
+    projectDialogInitialQueryInstructions: "",
     diagrams: [] as DiagramRecord[],
     diagramsLoading: false,
     diagramError: "",
@@ -289,10 +304,12 @@ export const useSessionStore = defineStore("session", {
         this.projectDialogInitialName = info?.display_name ?? info?.name ?? "";
         this.projectDialogInitialDescription = info?.description ?? "";
         this.projectDialogInitialVersion = info?.version ?? "";
+        this.projectDialogInitialQueryInstructions = info?.query_instructions ?? "";
       } else {
         this.projectDialogInitialName = "";
         this.projectDialogInitialDescription = "";
         this.projectDialogInitialVersion = "";
+        this.projectDialogInitialQueryInstructions = "";
       }
       this.projectDialogOpen = true;
     },
@@ -340,7 +357,12 @@ export const useSessionStore = defineStore("session", {
       }
       this.ensureDefaultQueryTab();
     },
-    async updateActiveProjectDetails(displayName: string, description: string, version: string): Promise<ProjectInfo> {
+    async updateActiveProjectDetails(
+      displayName: string,
+      description: string,
+      version: string,
+      queryInstructions?: string,
+    ): Promise<ProjectInfo> {
       const info = this.activeProjectInfo;
       if (!info) {
         throw new Error("No active project selected.");
@@ -350,13 +372,14 @@ export const useSessionStore = defineStore("session", {
         display_name: displayName,
         description,
         version,
+        query_instructions: queryInstructions,
       });
       this._applyProjectUpdate(updated);
       return updated;
     },
-    async createProjectEntry(name: string, description: string): Promise<ProjectInfo> {
-      const created = await createProjectApi({ name, description });
-      
+    async createProjectEntry(name: string, description: string, queryInstructions?: string): Promise<ProjectInfo> {
+      const created = await createProjectApi({ name, description, query_instructions: queryInstructions });
+
       // Reset workspace state for the new project
       this.workspaceTabs = [];
       this.activeWorkspaceTabId = undefined;
@@ -382,6 +405,7 @@ export const useSessionStore = defineStore("session", {
         description: updated.description,
         is_active: updated.is_active,
         version: updated.version,
+        query_instructions: updated.query_instructions,
       };
       if (index !== -1) {
         this.projects.splice(index, 1, merged);
@@ -427,12 +451,14 @@ export const useSessionStore = defineStore("session", {
         typeof projectDisplayNameRaw === "string" && projectDisplayNameRaw.trim()
           ? projectDisplayNameRaw
           : this.activeProjectDisplayName ?? this.activeProject ?? "";
+      const queryInstructions = typeof schemaRecord.query_instructions === "string" ? schemaRecord.query_instructions : "";
       const info = this.activeProjectInfo;
       if (info) {
         this._applyProjectUpdate({
           ...info,
           display_name: projectDisplayName,
           description: projectDescription,
+          query_instructions: queryInstructions,
           is_active: info.is_active,
         });
       }
@@ -467,9 +493,13 @@ export const useSessionStore = defineStore("session", {
       await this.loadDiagrams().catch(() => undefined);
       await this.loadQueries().catch(() => undefined);
     },
-    async sendMessage(message: string, file?: { name: string; content: string }): Promise<ChatResponse> {
-      if (!message.trim() && !file) {
-        throw new Error("Message or file is required.");
+    async sendMessage(
+      message: string, 
+      file?: { name: string; content: string },
+      images?: Array<{ data: string; name: string }>
+    ): Promise<ChatResponse> {
+      if (!message.trim() && !file && (!images || images.length === 0)) {
+        throw new Error("Message, file, or image is required.");
       }
       const userEntry: ChatEntry = {
         id: makeId(),
@@ -501,6 +531,7 @@ export const useSessionStore = defineStore("session", {
             file_content: file?.content,
             filename: file?.name,
             session_id: this.currentSessionId,
+            images,
           },
           (chunk: { 
             type: string; 
@@ -751,6 +782,38 @@ export const useSessionStore = defineStore("session", {
       await deleteQueryApi(id, { project: this.activeProject, database: this.activeDatabase });
       this.queries = this.queries.filter((query) => query.id !== id);
     },
+    async updateQueryRecord(id: string, name: string, description: string): Promise<QueryRecord> {
+      if (!this.activeProject && !this.activeDatabase) {
+        throw new Error("Select a project before updating a query.");
+      }
+      const existing = this.queries.find((q) => q.id === id);
+      if (!existing) {
+        throw new Error("Query not found.");
+      }
+      
+      const record = await saveQueryApi({
+        name,
+        description,
+        sql: existing.sql,
+        limit: existing.limit ?? undefined,
+        project: this.activeProject,
+        database: this.activeDatabase,
+        query_id: id,
+      });
+      
+      const filtered = this.queries.filter((query) => query.id !== record.id);
+      this.queries = [record, ...filtered];
+      
+      // Also update any open tabs that reference this query
+      for (const tab of this.workspaceTabs) {
+        if (tab.type === "query" && tab.queryId === id) {
+          tab.title = record.name;
+          tab.queryDescription = record.description ?? "";
+        }
+      }
+      
+      return record;
+    },
     openQueryFromSaved(id: string): string | undefined {
       const record = this.queries.find((query) => query.id === id);
       if (!record) {
@@ -778,13 +841,13 @@ export const useSessionStore = defineStore("session", {
       if (!tables.length) {
         return undefined;
       }
-      const layout: Record<string, { x: number; y: number }> = {};
+      const layout: Record<string, { x: number; y: number; width?: number }> = {};
       for (const entry of record.tables) {
         const trimmed = entry.name?.trim();
         if (!trimmed) {
           continue;
         }
-        layout[trimmed] = { x: entry.x, y: entry.y };
+        layout[trimmed] = { x: entry.x, y: entry.y, width: entry.width };
       }
       return this.createDiagramTab({
         tables,
@@ -863,6 +926,10 @@ export const useSessionStore = defineStore("session", {
       if (typeof window !== "undefined") {
         window.localStorage.setItem(STORAGE_CHAT_WIDTH_KEY, String(clamped));
       }
+    },
+    setQueryEditorHeight(height: number) {
+      this.queryEditorHeight = height;
+      window.localStorage.setItem(STORAGE_QUERY_EDITOR_HEIGHT_KEY, String(height));
     },
     ensureDefaultQueryTab(): void {
       if (this.workspaceTabs.length === 0) {
@@ -1198,6 +1265,16 @@ export const useSessionStore = defineStore("session", {
       tab.selectedTables = Array.from(new Set([tableName, ...(tab.selectedTables ?? [])]));
       this.setSelectedTable(tableName);
     },
+    openMarkdownTab(title: string, content: string): void {
+      const id = `markdown-${Date.now()}`;
+      this.workspaceTabs.push({
+        id,
+        type: "markdown",
+        title,
+        content,
+      });
+      this.activeWorkspaceTabId = id;
+    },
     closeWorkspaceTab(id: string): void {
       const index = this.workspaceTabs.findIndex((tab) => tab.id === id);
       if (index === -1) {
@@ -1235,6 +1312,24 @@ export const useSessionStore = defineStore("session", {
       if (wasActive) {
         const next = this.workspaceTabs[index] ?? this.workspaceTabs[index - 1] ?? this.workspaceTabs[0];
         this.activeWorkspaceTabId = next?.id;
+      }
+    },
+    updateDiagramLayout(tabId: string, tableName: string, position: { x: number; y: number; width?: number }): void {
+      const tab = this.workspaceTabs.find(
+        (item): item is DiagramTabState => item.id === tabId && item.type === "diagram",
+      );
+      if (tab) {
+        if (!tab.layout) {
+          tab.layout = {};
+        }
+        tab.layout[tableName] = position;
+      }
+    },
+    updateQueryTab(id: string, updates: Partial<QueryTabState>): void {
+      const tab = this.workspaceTabs.find((item): item is QueryTabState => item.id === id && item.type === "query");
+      if (tab) {
+        Object.assign(tab, updates);
+        refreshQueryDirtyFlag(tab);
       }
     },
   },

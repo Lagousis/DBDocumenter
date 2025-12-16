@@ -30,15 +30,22 @@ class DuckDBSchemaTool(Tool):
                 "get_table_info (detailed table info with fields and relationships), "
                 "list_saved_queries (show saved SQL queries), "
                 "get_full_schema (complete schema with all tables and fields), "
+                "search_fields (search for fields across all tables), "
                 "update_field (update field metadata), "
                 "update_table (update table metadata), "
-                "update_fields_batch (update multiple fields at once)."
+                "update_fields_batch (update multiple fields at once), "
+                "infer_nullability (check all fields in a table for null values)."
             ),
             "nullable": False,
         },
         "table_name": {
             "type": "string",
             "description": "Target table name.",
+            "nullable": True,
+        },
+        "query": {
+            "type": "string",
+            "description": "Search query for search_fields action.",
             "nullable": True,
         },
         "field_name": {
@@ -50,7 +57,7 @@ class DuckDBSchemaTool(Tool):
             "type": "string",
             "description": (
                 "JSON string list of fields for update_fields_batch. "
-                "Example: '[{\"name\": \"col1\", \"short_description\": \"desc\"}]'"
+                "Example: '[{\"name\": \"col1\", \"short_description\": \"desc\", \"nullability\": \"NOT NULL\"}]'"
             ),
             "nullable": True,
         },
@@ -69,9 +76,19 @@ class DuckDBSchemaTool(Tool):
             "description": "Data type for the field (e.g., INTEGER, VARCHAR).",
             "nullable": True,
         },
+        "nullability": {
+            "type": "string",
+            "description": "Nullability status. Standard values: 'NULL', 'NOT NULL'.",
+            "nullable": True,
+        },
         "description": {
             "type": "string",
             "description": "Deprecated. Use long_description instead.",
+            "nullable": True,
+        },
+        "ignored": {
+            "type": "boolean",
+            "description": "Whether to ignore this field in documentation and analysis.",
             "nullable": True,
         },
     }
@@ -91,11 +108,14 @@ class DuckDBSchemaTool(Tool):
         action: Optional[str] = None,
         table_name: Optional[str] = None,
         field_name: Optional[str] = None,
+        query: Optional[str] = None,
         short_description: Optional[str] = None,
         long_description: Optional[str] = None,
         data_type: Optional[str] = None,
+        nullability: Optional[str] = None,
         description: Optional[str] = None,  # Backward compatibility
         fields_json: Optional[str] = None,
+        ignored: Optional[bool] = None,
     ) -> dict[str, str]:
         if not action:
             raise ValueError("Action is required.")
@@ -125,18 +145,119 @@ class DuckDBSchemaTool(Tool):
                     if not f_name:
                         continue
 
+                    # Report progress if agent callback is available
+                    if hasattr(self, "_agent_ref") and hasattr(self._agent_ref, "_on_step") and self._agent_ref._on_step:
+                        self._agent_ref._on_step(f"Updating field {table_name}.{f_name}...")
+
+                    # If data_type is not provided or is generic, try to infer from sample data
+                    provided_type = field_item.get("data_type")
+                    inferred_type = provided_type
+                    
+                    if provided_type and provided_type.upper() in ["VARCHAR", "TEXT", "STRING", "UNKNOWN"]:
+                        try:
+                            # Sample data to infer more accurate type
+                            sample_sql = (
+                                f'SELECT DISTINCT "{f_name}" FROM "{table_name}" '
+                                f'WHERE "{f_name}" IS NOT NULL LIMIT 10'
+                            )
+                            sample_result = self.query_tool.execute_structured(sample_sql)
+                            
+                            if sample_result and hasattr(sample_result, 'rows') and sample_result.rows:
+                                sample_values = [str(row[0]) for row in sample_result.rows if row]
+                                
+                                # Check for UUID pattern
+                                uuid_pattern_count = 0
+                                for val in sample_values:
+                                    # UUID format: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+                                    parts = val.split('-')
+                                    if len(parts) == 5 and len(parts[0]) == 8 and len(parts[1]) == 4 and \
+                                       len(parts[2]) == 4 and len(parts[3]) == 4 and len(parts[4]) == 12:
+                                        try:
+                                            # Check if all parts are hex
+                                            all(int(part, 16) for part in parts)
+                                            uuid_pattern_count += 1
+                                        except ValueError:
+                                            pass
+                                
+                                # If most values look like UUIDs, use UUID type
+                                if uuid_pattern_count >= len(sample_values) * 0.8:
+                                    inferred_type = "UUID"
+                        except Exception as e:
+                            # If sampling fails, use provided type or default
+                            print(f"Warning: Could not sample data for {table_name}.{f_name}: {e}")
+                            pass
+
                     manager.update_field(
                         table_name,
                         f_name,
                         short_description=field_item.get("short_description"),
                         long_description=field_item.get("long_description"),
-                        data_type=field_item.get("data_type")
+                        data_type=inferred_type,
+                        nullability=field_item.get("nullability")
                     )
                     results.append(f_name)
 
                 return {"result": f"Updated metadata for {len(results)} fields in {table_name}: {', '.join(results)}"}
             except Exception as e:
                 return {"result": f"Failed to batch update fields: {str(e)}"}
+
+        # Infer nullability for all fields in a table
+        if normalized_action == "infer_nullability":
+            if not table_name:
+                raise ValueError("table_name is required for infer_nullability action.")
+
+            try:
+                # 1. Get all fields
+                columns = self.query_tool.fetch_table_schema(table_name)
+                if not columns:
+                    return {"result": f"Table {table_name} not found or has no columns."}
+
+                # 2. Build query to count nulls for each column
+                select_parts = []
+                col_names = []
+                for col in columns:
+                    name = col.get('name')
+                    if name:
+                        col_names.append(name)
+                        # Use SUM(CASE...) to count nulls
+                        select_parts.append(f'SUM(CASE WHEN "{name}" IS NULL THEN 1 ELSE 0 END) as "{name}"')
+
+                if not select_parts:
+                    return {"result": "No columns found to check."}
+
+                sql = f'SELECT {", ".join(select_parts)} FROM "{table_name}"'
+                
+                # 3. Execute query
+                result = self.query_tool.execute_structured(sql)
+                
+                if not result or not result.rows:
+                    return {"result": "Failed to execute nullability check query."}
+
+                # 4. Process results and update metadata
+                row = result.rows[0]
+                updates = []
+                
+                for i, count in enumerate(row):
+                    col_name = result.columns[i]
+
+                    # Report progress
+                    if hasattr(self, "_agent_ref") and hasattr(self._agent_ref, "_on_step") and self._agent_ref._on_step:
+                        self._agent_ref._on_step(f"Updating nullability for {table_name}.{col_name}...")
+
+                    has_nulls = count > 0
+                    nullability = "NULL" if has_nulls else "NOT NULL"
+                    
+                    manager.update_field(
+                        table_name,
+                        col_name,
+                        nullability=nullability
+                    )
+                    updates.append(f"{col_name}: {nullability} ({count} nulls)")
+
+                return {"result": f"Inferred nullability for {len(updates)} fields in {table_name}:\n" + "\n".join(updates)}
+
+            except Exception as e:
+                return {"result": f"Failed to infer nullability: {str(e)}"}
 
         # List all tables with descriptions
         if normalized_action == "list_tables":
@@ -199,26 +320,37 @@ class DuckDBSchemaTool(Tool):
             for lower_name in all_field_names:
                 # Prefer documented name casing, fallback to DB name
                 display_name = doc_fields.get(lower_name, (db_fields.get(lower_name, {}).get("name"), {}))[0]
+                doc_data = doc_fields.get(lower_name, (None, {}))[1]
+
+                # Skip ignored fields
+                if doc_data.get("ignored"):
+                    continue
 
                 # Get data type from DB (truth) or docs (fallback)
                 db_type = db_fields.get(lower_name, {}).get("type")
-                doc_data = doc_fields.get(lower_name, (None, {}))[1]
                 doc_type = doc_data.get("data_type")
 
                 final_type = db_type or doc_type or "unknown"
 
                 line = f"- {display_name} ({final_type})"
 
+                # Include both short and long descriptions for SQL context
+                short_desc = doc_data.get("short_description")
+                long_desc = doc_data.get("long_description")
+                
                 descriptions = []
-                if doc_data.get("short_description"):
-                    descriptions.append(doc_data["short_description"])
-                if doc_data.get("long_description"):
-                    descriptions.append(doc_data["long_description"])
-
+                if short_desc:
+                    descriptions.append(short_desc)
+                if long_desc:
+                    # Limit long description to reasonable length
+                    if len(long_desc) > 200:
+                        long_desc = long_desc[:197] + "..."
+                    descriptions.append(long_desc)
+                
                 if descriptions:
                     line += ": " + " | ".join(descriptions)
                 elif lower_name not in doc_fields:
-                    line += " [Undocumented in schema]"
+                    line += " [Undocumented]"
 
                 lines.append(line)
 
@@ -256,6 +388,8 @@ class DuckDBSchemaTool(Tool):
             if fields:
                 result_lines.append("\nFields:")
                 for field_name, field_data in fields.items():
+                    if field_data.get("ignored"):
+                        continue
                     data_type = field_data.get("data_type", "")
                     short_desc = field_data.get("short_description", "")
                     long_desc = field_data.get("long_description", "")
@@ -328,6 +462,8 @@ class DuckDBSchemaTool(Tool):
                     lines.append(f"  Description: {short_desc}")
                 lines.append(f"  Fields ({len(fields)}):")
                 for field_name, field_data in fields.items():
+                    if field_data.get("ignored"):
+                        continue
                     data_type = field_data.get("data_type", "")
                     lines.append(f"    - {field_name} ({data_type})")
 
@@ -344,7 +480,9 @@ class DuckDBSchemaTool(Tool):
                     field_name,
                     short_description=short_description,
                     long_description=long_description,
-                    data_type=data_type
+                    data_type=data_type,
+                    nullability=nullability,
+                    ignored=ignored
                 )
                 return {"result": f"Updated metadata for {table_name}.{field_name}."}
             except Exception as e:
@@ -375,6 +513,67 @@ class DuckDBSchemaTool(Tool):
                 return {"result": f"Updated description for {table_name}.{field_name}."}
             except Exception as e:
                 return {"result": f"Failed to update field: {str(e)}"}
+
+        # Search fields across all tables
+        if normalized_action == "search_fields":
+            if not query:
+                raise ValueError("query is required for search_fields action.")
+            
+            search_term = query.lower()
+            matches = []
+            
+            # Get all tables
+            try:
+                tables = self.query_tool.list_tables_in_database()
+            except Exception:
+                tables = manager.list_tables()
+            
+            if not tables:
+                return {"result": "No tables found to search."}
+                
+            for table in tables:
+                # Report progress
+                if hasattr(self, "_agent_ref") and hasattr(self._agent_ref, "_on_step") and self._agent_ref._on_step:
+                    self._agent_ref._on_step(f"Searching in table {table}...")
+
+                # Check table name match
+                if search_term in table.lower():
+                    matches.append(f"Table: {table} (Name match)")
+                
+                # Check fields
+                try:
+                    columns = self.query_tool.fetch_table_schema(table)
+                    for col in columns:
+                        col_name = col.get('name', '')
+                        if search_term in str(col_name).lower():
+                            col_type = col.get('type', col.get('column_type', 'unknown'))
+                            matches.append(f"Field: {table}.{col_name} ({col_type})")
+                except Exception:
+                    pass
+                    
+                # Check documentation
+                table_record = manager.get_table(table)
+                if table_record:
+                    # Check table description
+                    t_desc = (table_record.get("short_description") or "") + " " + (table_record.get("long_description") or "")
+                    if search_term in t_desc.lower():
+                         matches.append(f"Table: {table} (Description match)")
+                         
+                    # Check field descriptions
+                    fields = table_record.get("fields", {})
+                    for f_name, f_data in fields.items():
+                        if f_data.get("ignored"):
+                            continue
+                        f_desc = (f_data.get("short_description") or "") + " " + (f_data.get("long_description") or "")
+                        if search_term in f_desc.lower():
+                             matches.append(f"Field: {table}.{f_name} (Description match)")
+
+            if not matches:
+                return {"result": f"No matches found for '{query}'."}
+            
+            # Deduplicate and sort
+            unique_matches = sorted(list(set(matches)))
+            return {"result": f"Search results for '{query}':\n" + "\n".join(unique_matches)}
 
         raise ValueError(
             f"Unknown action '{action}'. Supported: list_tables, list_fields, "

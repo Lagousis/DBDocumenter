@@ -13,6 +13,7 @@ class ProjectInfo(BaseModel):
     description: str = ""
     is_active: bool = False
     version: Optional[str] = None
+    query_instructions: Optional[str] = None
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -20,11 +21,13 @@ class ProjectUpdateRequest(BaseModel):
     display_name: Optional[str] = Field(None, description="Human-friendly project display name.")
     description: Optional[str] = Field(None, description="Project description text.")
     version: Optional[str] = Field(None, description="Project version string.")
+    query_instructions: Optional[str] = Field(None, description="Instructions for LLM query generation.")
 
 
 class ProjectCreateRequest(BaseModel):
     name: str = Field(..., description="Display name for the new DuckDB project.")
     description: Optional[str] = Field("", description="Optional project description.")
+    query_instructions: Optional[str] = Field("", description="Optional query instructions.")
 
 
 class QueryRequest(BaseModel):
@@ -50,6 +53,7 @@ class QueryRecord(BaseModel):
     description: Optional[str] = ""
     sql: str
     limit: Optional[int] = None
+    updated_at: Optional[str] = None
 
 
 class QuerySaveRequest(BaseModel):
@@ -66,13 +70,20 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="User message to send to the assistant.")
     reset: bool = Field(False, description="When true, resets the conversation history.")
     project: Optional[str] = Field(None, description="Optional project name to activate before responding.")
-    database: Optional[str] = Field(None, description="Explicit DuckDB file path to activate before responding.")
+    database: Optional[str] = Field(
+        None, description="Explicit DuckDB file path to activate before responding."
+    )
     file_content: Optional[str] = Field(
         None,
         description="Optional file content (text or base64) to include in context."
     )
     filename: Optional[str] = Field(None, description="Optional filename for the uploaded content.")
-    session_id: Optional[str] = Field(None, description="Optional session ID to continue an existing chat.")
+    session_id: Optional[str] = Field(
+        None, description="Optional session ID to continue an existing chat."
+    )
+    images: Optional[List[Dict[str, str]]] = Field(
+        None, description="Optional list of images with 'data' (base64) and 'name' fields."
+    )
 
 
 class ChatResponse(BaseModel):
@@ -115,6 +126,7 @@ class FieldUpdateRequest(BaseModel):
     data_type: Optional[str] = None
     values: Optional[Dict[str, str]] = None
     relationships: Optional[List[RelationshipPayload]] = None
+    ignored: Optional[bool] = None
 
 
 class FieldUpdateResponse(BaseModel):
@@ -169,6 +181,7 @@ class DiagramTablePosition(BaseModel):
     name: str
     x: float
     y: float
+    width: Optional[float] = None
 
 
 class DiagramRecord(BaseModel):
@@ -320,7 +333,19 @@ class QueryAssistRequest(BaseModel):
 
 
 class QueryAssistResponse(BaseModel):
-    sql: str = Field(..., description="The improved or fixed SQL query.")
+    sql: str
+
+
+class QueryErrorAssistRequest(BaseModel):
+    sql: str = Field(..., description="The SQL query that failed.")
+    error: str = Field(..., description="The error message returned by the database.")
+    project: Optional[str] = Field(None, description="Optional project name to target.")
+    database: Optional[str] = Field(None, description="Explicit DuckDB file path to target.")
+
+
+class QueryErrorAssistResponse(BaseModel):
+    explanation: str
+    fixed_sql: str
 
 
 class ChatMessage(BaseModel):

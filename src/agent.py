@@ -7,10 +7,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
-from openai import APIConnectionError, AzureOpenAI
+from openai import APIConnectionError, AzureOpenAI, RateLimitError
 
 if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
@@ -61,6 +61,7 @@ class DirectOpenAIAgent:
         chart_tool: DuckDBChartTool,
         system_prompt: str,
         max_iterations: int = 10,
+        max_history_messages: int = 20,
     ) -> None:
         self.client = client
         self.model = model
@@ -69,6 +70,7 @@ class DirectOpenAIAgent:
         self.chart_tool = chart_tool
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
+        self.max_history_messages = max_history_messages
         self._last_sql_query: Optional[str] = None
         self._last_implementation_plan: Optional[str] = None
         self.conversation_history: List[Dict[str, Any]] = []
@@ -92,6 +94,14 @@ class DirectOpenAIAgent:
                             "sql": {
                                 "type": "string",
                                 "description": "The SQL query to execute"
+                            },
+                            "output_format": {
+                                "type": "string",
+                                "enum": ["text", "table", "csv"],
+                                "description": (
+                                    "Preferred output formatting for results. "
+                                    "Use 'table' for tabular output."
+                                ),
                             },
                             "plan": {
                                 "type": "string",
@@ -126,7 +136,8 @@ class DirectOpenAIAgent:
                                     "get_full_schema",
                                     "update_field",
                                     "update_table",
-                                    "update_fields_batch"
+                                    "update_fields_batch",
+                                    "infer_nullability"
                                 ],
                                 "description": (
                                     "list_tables: show all tables, "
@@ -134,9 +145,10 @@ class DirectOpenAIAgent:
                                     "get_table_info: detailed info with relationships, "
                                     "list_saved_queries: show saved SQL queries, "
                                     "get_full_schema: complete schema summary, "
-                                    "update_field: update field metadata (desc, type), "
+                                    "update_field: update field metadata (desc, type, nullability), "
                                     "update_table: update table metadata (desc), "
-                                    "update_fields_batch: update multiple fields (requires fields_json)"
+                                    "update_fields_batch: update multiple fields (requires fields_json), "
+                                    "infer_nullability: check all fields in a table for null values"
                                 )
                             },
                             "table_name": {
@@ -149,7 +161,10 @@ class DirectOpenAIAgent:
                             },
                             "fields_json": {
                                 "type": "string",
-                                "description": "JSON string list of fields for update_fields_batch"
+                                "description": (
+                                    "JSON string list of fields for update_fields_batch. "
+                                    "Can include 'nullability' (use 'NULL'/'NOT NULL')."
+                                ),
                             },
                             "short_description": {
                                 "type": "string",
@@ -162,6 +177,13 @@ class DirectOpenAIAgent:
                             "data_type": {
                                 "type": "string",
                                 "description": "Data type for field (for update_field)"
+                            },
+                            "nullability": {
+                                "type": "string",
+                                "description": (
+                                    "Nullability status. Standard values: 'NULL', 'NOT NULL'. "
+                                    "Do not use 'nullable' or 'not nullable'."
+                                ),
                             }
                         },
                         "required": ["action"]
@@ -215,13 +237,47 @@ class DirectOpenAIAgent:
             }
         ]
 
-    def run(self, prompt: str, *, reset: bool = False, **kwargs) -> str:
+    def _trim_conversation_history(self) -> None:
+        """
+        Trim conversation history to prevent token limit issues.
+        Keeps system message + most recent messages up to max_history_messages.
+        """
+        if len(self.conversation_history) <= self.max_history_messages + 1:
+            # +1 for system message
+            return
+
+        # Separate system message from conversation
+        system_messages = [msg for msg in self.conversation_history if msg.get("role") == "system"]
+        other_messages = [msg for msg in self.conversation_history if msg.get("role") != "system"]
+
+        # Keep only the most recent messages
+        if len(other_messages) > self.max_history_messages:
+            other_messages = other_messages[-self.max_history_messages:]
+
+        # Reconstruct history: system + recent messages
+        self.conversation_history = system_messages + other_messages
+
+    def run(
+        self,
+        prompt: str,
+        *,
+        reset: bool = False,
+        images: Optional[List[Dict[str, str]]] = None,
+        on_step: Optional[Callable[[str], None]] = None,
+        **kwargs,
+    ) -> str:
         """Execute the agent with function calling loop."""
         start_time = time.time()
         tools_used = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
         api_calls = 0
+
+        if on_step:
+            on_step("Thinking...")
+
+        # Store callback for tools to use
+        self._on_step = on_step
 
         if reset:
             self.conversation_history = []
@@ -239,31 +295,90 @@ class DirectOpenAIAgent:
                 "content": self.system_prompt
             })
 
-        # Add user message
-        self.conversation_history.append({
-            "role": "user",
-            "content": prompt
-        })
+        # Add user message - support multimodal if images are provided
+        if images:
+            # Construct multimodal message with text and images
+            content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for img in images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": img["data"]  # data should be base64 data URL like "data:image/jpeg;base64,..."
+                    }
+                })
+            self.conversation_history.append({
+                "role": "user",
+                "content": content_parts
+            })
+        else:
+            # Text-only message
+            self.conversation_history.append({
+                "role": "user",
+                "content": prompt
+            })
 
         # Function calling loop
         for iteration in range(self.max_iterations):
             api_calls += 1
+
+            print(f"DEBUG: Agent iteration {iteration + 1}/{self.max_iterations}")
+
+            # Trim conversation history to prevent token limit issues
+            self._trim_conversation_history()
+
             try:
                 # Cast types for Pylance
                 messages_param: Iterable[ChatCompletionMessageParam] = self.conversation_history  # type: ignore
                 tools_param: Iterable[ChatCompletionToolParam] = self.functions  # type: ignore
 
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages_param,
-                    tools=tools_param,
-                    tool_choice="auto"
-                )
+                print("DEBUG: Making API call to Azure OpenAI...")
+                api_start_time = time.time()
+
+                # Implement retry logic for RateLimitError
+                max_retries = 3
+                retry_count = 0
+                response = None
+
+                while True:
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages_param,
+                            tools=tools_param,
+                            tool_choice="auto"
+                        )
+                        break
+                    except RateLimitError as e:
+                        retry_count += 1
+                        if retry_count > max_retries:
+                            raise
+
+                        # Default wait time
+                        wait_time = 20 * retry_count
+
+                        # Try to extract wait time from error message
+                        import re
+                        match = re.search(r"retry after (\d+) seconds", str(e), re.IGNORECASE)
+                        if match:
+                            wait_time = int(match.group(1)) + 5  # Add 5s buffer
+
+                        print(
+                            f"DEBUG: Rate limit reached. Retrying in {wait_time} seconds... "
+                            f"(Attempt {retry_count}/{max_retries})"
+                        )
+                        time.sleep(wait_time)
+
+                api_elapsed = time.time() - api_start_time
+                print(f"DEBUG: API call completed in {api_elapsed:.2f}s")
             except APIConnectionError as e:
                 # Enhance the error message with the endpoint
                 raise RuntimeError(
                     f"Connection failed to Azure OpenAI endpoint: {self.client.base_url}. "
                     "Please check your internet connection and the AZURE_OPENAI_ENDPOINT setting."
+                ) from e
+            except RateLimitError as e:
+                raise RuntimeError(
+                    "Rate limit exceeded. Please wait before making more requests."
                 ) from e
 
             # Capture token usage
@@ -273,11 +388,28 @@ class DirectOpenAIAgent:
 
             message = response.choices[0].message
 
+            # Normalize tool_calls to list of dicts for history consistency
+            tool_calls_data = []
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    if isinstance(tc, dict):
+                        tool_calls_data.append(tc)
+                    else:
+                        # Convert Pydantic model/object to dict
+                        tool_calls_data.append({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        })
+
             # Add assistant message to history
             self.conversation_history.append({
                 "role": "assistant",
                 "content": message.content,
-                "tool_calls": message.tool_calls
+                "tool_calls": tool_calls_data if tool_calls_data else None
             })
 
             # If no tool calls, we're done
@@ -287,48 +419,101 @@ class DirectOpenAIAgent:
 
             # Execute tool calls
             for tool_call in message.tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
+                if isinstance(tool_call, dict):
+                    function_name = tool_call["function"]["name"]
+                    function_args = json.loads(tool_call["function"]["arguments"])
+                    tool_id = tool_call["id"]
+                else:
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments)
+                    tool_id = tool_call.id
+
+                print(f"DEBUG: Executing tool '{function_name}' with args: {function_args}")
+
+                if on_step:
+                    step_msg = f"Executing {function_name}..."
+                    if function_name == "duckdb_schema":
+                        action = function_args.get("action")
+                        if action == "update_fields_batch":
+                            step_msg = f"Updating multiple fields in {function_args.get('table_name')}..."
+                        elif action == "infer_nullability":
+                            step_msg = f"Checking nullability for {function_args.get('table_name')}..."
+                        elif action == "update_field":
+                            step_msg = (
+                                f"Updating field {function_args.get('table_name')}."
+                                f"{function_args.get('field_name')}..."
+                            )
+                    elif function_name == "duckdb_query":
+                        step_msg = "Running SQL query..."
+
+                    on_step(step_msg)
+
+                tool_start_time = time.time()
 
                 # Track tool usage
                 tools_used.append({
                     "name": function_name,
-                    "arguments": function_args
+                    "arguments": function_args,
+                    "id": tool_id
                 })
 
-                # Execute the appropriate tool
-                if function_name == "duckdb_query":
-                    tool_result = self.query_tool(
-                        sql=function_args["sql"],
-                        plan=function_args.get("plan")
+                # Execute the appropriate tool with error handling
+                try:
+                    if function_name == "duckdb_query":
+                        self._last_sql_query = function_args.get("sql")
+                        self._last_implementation_plan = function_args.get("plan")
+                        tool_result = self.query_tool(
+                            sql=function_args["sql"],
+                            plan=function_args.get("plan"),
+                            output_format=function_args.get("output_format", "table"),
+                        )
+                    elif function_name == "duckdb_schema":
+                        tool_result = self.schema_tool(
+                            action=function_args["action"],
+                            table_name=function_args.get("table_name"),
+                            field_name=function_args.get("field_name"),
+                            short_description=function_args.get("short_description"),
+                            long_description=function_args.get("long_description"),
+                            data_type=function_args.get("data_type"),
+                            nullability=function_args.get("nullability"),
+                            fields_json=function_args.get("fields_json")
+                        )
+                    elif function_name == "duckdb_chart":
+                        tool_result = self.chart_tool(
+                            sql=function_args["sql"],
+                            chart_type=function_args.get("chart_type", "bar"),
+                            title=function_args.get("title", ""),
+                            x_label=function_args.get("x_label", ""),
+                            y_label=function_args.get("y_label", ""),
+                            plan=function_args.get("plan", "")
+                        )
+                    else:
+                        tool_result = f"Unknown function: {function_name}"
+                except Exception as e:
+                    # Capture tool execution errors and return them as tool results
+                    tool_result = f"Error executing {function_name}: {str(e)}"
+                    print(f"Tool execution error: {tool_result}")
+
+                tool_elapsed = time.time() - tool_start_time
+                print(f"DEBUG: Tool '{function_name}' completed in {tool_elapsed:.2f}s")
+
+                if on_step:
+                    on_step(f"Finished {function_name} ({tool_elapsed:.2f}s)")
+
+                # Truncate very long tool results to prevent token overflow
+                tool_result_str = str(tool_result)
+                max_tool_result_length = 50000  # Increased to allow larger tables
+                if len(tool_result_str) > max_tool_result_length:
+                    tool_result_str = (
+                        tool_result_str[:max_tool_result_length] +
+                        f"\n... [truncated {len(tool_result_str) - max_tool_result_length} characters]"
                     )
-                elif function_name == "duckdb_schema":
-                    tool_result = self.schema_tool(
-                        action=function_args["action"],
-                        table_name=function_args.get("table_name"),
-                        field_name=function_args.get("field_name"),
-                        short_description=function_args.get("short_description"),
-                        long_description=function_args.get("long_description"),
-                        data_type=function_args.get("data_type"),
-                        fields_json=function_args.get("fields_json")
-                    )
-                elif function_name == "duckdb_chart":
-                    tool_result = self.chart_tool(
-                        sql=function_args["sql"],
-                        chart_type=function_args.get("chart_type", "bar"),
-                        title=function_args.get("title", ""),
-                        x_label=function_args.get("x_label", ""),
-                        y_label=function_args.get("y_label", ""),
-                        plan=function_args.get("plan", "")
-                    )
-                else:
-                    tool_result = f"Unknown function: {function_name}"
 
                 # Add tool response to history
                 self.conversation_history.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": str(tool_result)
+                    "tool_call_id": tool_id,
+                    "content": tool_result_str
                 })
         else:
             # Max iterations reached
@@ -386,6 +571,163 @@ class DirectOpenAIAgent:
                     pattern = re.compile(r"```chart\n[\s\S]*?```", re.IGNORECASE)
                     result = pattern.sub(f"```chart\n{chart_json}\n```", result, count=1)
 
+        # Post-process: if duckdb_query was used, ensure results include a Markdown table.
+        # This prevents the model from summarizing results into a single line.
+        def _extract_tabular_lines(tool_text: str) -> list[str]:
+            lines = [line.rstrip("\r") for line in (tool_text or "").split("\n")]
+            # Skip the leading database header lines.
+            start_idx = 0
+            for i, line in enumerate(lines):
+                if "|" in line:
+                    start_idx = i
+                    break
+            table_lines: list[str] = []
+            for line in lines[start_idx:]:
+                if not line.strip():
+                    # Stop at first blank line after we started capturing.
+                    if table_lines:
+                        break
+                    continue
+
+                if "|" in line or line.strip().replace("-", "").replace("+", "").strip() == "":
+                    table_lines.append(line)
+                    continue
+
+                # Stop when we hit schema metadata / narrative.
+                if table_lines:
+                    break
+            return table_lines
+
+        def _pipe_table_to_markdown(table_lines: list[str]) -> str:
+            if not table_lines:
+                return ""
+
+            # Remove obvious ASCII borders (e.g., +----+----+)
+            cleaned = [ln for ln in table_lines if not ln.strip().startswith("+")]
+            if not cleaned:
+                return ""
+
+            # Find header as first line with pipes.
+            header_line = next((ln for ln in cleaned if "|" in ln), "")
+            if not header_line:
+                return ""
+
+            def split_row(line: str) -> list[str]:
+                # Split by pipe, but handle the outer pipes correctly
+                # A line like "| a | b |" split by "|" gives ['', ' a ', ' b ', '']
+                parts = line.strip().split("|")
+                # Remove the first and last empty strings resulting from outer pipes
+                if len(parts) >= 2 and parts[0] == "" and parts[-1] == "":
+                    parts = parts[1:-1]
+
+                return [p.strip() for p in parts]
+
+            headers = split_row(header_line)
+            if not headers:
+                return ""
+
+            rows: list[list[str]] = []
+            for ln in cleaned[cleaned.index(header_line) + 1:]:
+                # Skip separator-ish lines
+                stripped = ln.strip()
+                if not stripped:
+                    continue
+                if "-+-" in stripped:
+                    continue
+                if all(ch in "-:|+ " for ch in stripped):
+                    continue
+                if "|" not in ln:
+                    continue
+                row = split_row(ln)
+                if row and len(row) == len(headers):
+                    rows.append(row)
+
+            # If only header present, still render a table
+            sep = "| " + " | ".join(["---"] * len(headers)) + " |"
+            md = ["| " + " | ".join(headers) + " |", sep]
+            for row in rows:
+                md.append("| " + " | ".join(row) + " |")
+            return "\n".join(md)
+
+        if isinstance(result, str):
+            used_query = any(t.get("name") == "duckdb_query" for t in tools_used)
+
+            def _has_markdown_table(text: str) -> bool:
+                """Return True only for a real Markdown table (header + separator row)."""
+                import re
+
+                # Require two consecutive lines: a pipe header and a separator line with at least one dash.
+                pattern = re.compile(
+                    r"(?m)^\s*\|.*\|\s*$\r?\n^\s*\|(?=[\s\-:|]*-)[\s\-:|]+\|\s*$"
+                )
+                return bool(pattern.search(text or ""))
+
+            if used_query:
+                # Find the best query result from CURRENT run (prefer largest table)
+                best_query_text = ""
+                max_rows = -1
+
+                # Get IDs of duckdb_query calls in this run
+                current_query_ids = {
+                    t["id"] for t in tools_used
+                    if t["name"] == "duckdb_query" and "id" in t
+                }
+
+                print(f"DEBUG POST-PROCESS: Found {len(current_query_ids)} duckdb_query IDs in this run")
+
+                # Iterate tool outputs to find the most significant duckdb_query result from THIS run
+                for msg in self.conversation_history:
+                    if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                        tid = msg["tool_call_id"]
+                        if tid in current_query_ids:
+                            content = msg["content"]
+                            print(f"DEBUG POST-PROCESS: Found tool output for query ID {tid}")
+                            print(f"DEBUG POST-PROCESS: Content length: {len(content)}")
+                            print(f"DEBUG POST-PROCESS: First 500 chars of content:\n{content[:500]}")
+                            # Extract lines to count data rows
+                            lines = _extract_tabular_lines(content)
+                            print(f"DEBUG POST-PROCESS: Extracted {len(lines)} table lines")
+                            # Count lines that look like data (contain | and aren't separators)
+                            row_count = 0
+                            for line in lines:
+                                stripped = line.strip()
+                                if "|" in line and not all(c in "-|+ " for c in stripped):
+                                    row_count += 1
+
+                            print(f"DEBUG POST-PROCESS: Counted {row_count} rows in tool output")
+
+                            # Prefer result with more rows; if equal, prefer later one
+                            if row_count >= max_rows:
+                                max_rows = row_count
+                                best_query_text = content
+
+                print(f"DEBUG POST-PROCESS: Best query has {max_rows} rows")
+
+                # Check if the agent already included the full table
+                # Now that frontend parsing is fixed, we only append if the agent didn't include it
+                if best_query_text and max_rows > 0:
+                    table_lines = _extract_tabular_lines(best_query_text)
+                    md_table = _pipe_table_to_markdown(table_lines)
+                    print(f"DEBUG POST-PROCESS: Generated markdown table with {md_table.count(chr(10))+1} lines")
+
+                    if md_table:
+                        # Check if the agent already included this table (normalize for comparison)
+                        # Remove commas and extra whitespace to handle formatting differences
+                        normalized_table = md_table.replace(',', '').replace(' ', '')
+                        normalized_result = result.replace(',', '').replace(' ', '')
+
+                        if normalized_table in normalized_result:
+                            print("DEBUG POST-PROCESS: Agent already included the full table, skipping append")
+                        else:
+                            print("DEBUG POST-PROCESS: Agent did NOT include full table, appending")
+                            result = f"{result}\n\n{md_table}"
+                            print(f"DEBUG POST-PROCESS: Final result length: {len(result)}")
+                else:
+                    print(
+                        "DEBUG POST-PROCESS: No table to append "
+                        f"(best_query_text={bool(best_query_text)}, max_rows={max_rows})"
+                    )
+
         # Post-process: inject SQL and plan markers if captured
         if self._last_sql_query and isinstance(result, str):
             has_sql = "```sql" in result.lower()
@@ -404,6 +746,8 @@ class DirectOpenAIAgent:
                 else:
                     result = f"{plan_marker}\n{result}"
 
+        # Clear callback
+        self._on_step = None
         return result
 
 
@@ -607,12 +951,15 @@ def create_duckdb_agent(
         "Focus your responses on the DuckDB schemas, tables, and data available in this project. "
         "If a user asks about unrelated topics, redirect them to questions about the documented datasets. "
         "\n\n"
-        "CRITICAL: ALWAYS CHECK SCHEMA BEFORE WRITING SQL\n"
-        "Before executing ANY SQL query, you MUST:\n"
+        "Guideline: Check schema before writing SQL\n"
+        "Before executing SQL queries, please follow these steps:\n"
         "1. Use duckdb_schema tool with action='list_tables' to see available tables\n"
         "2. If you need column information, use duckdb_schema with action='list_fields' and table_name parameter\n"
-        "3. Only then write the SQL query using the EXACT table and column names from the schema\n"
-        "4. NEVER guess table or column names - always verify them first using the schema tool\n"
+        "3. If you know a column name but not the table, use duckdb_schema "
+        "with action='search_fields' and query='column_name'\n"
+        "4. Write the SQL query using the EXACT table and column names from the schema\n"
+        "5. Verify table and column names using the schema tool\n"
+        "6. Avoid asking the user for table names if you can find them yourself using search_fields.\n"
         "\n"
         "This prevents errors like querying non-existent tables. "
         "The schema tool is fast and should be used liberally.\n"
@@ -638,24 +985,42 @@ def create_duckdb_agent(
         "```\n"
         "This chart shows the distribution of orders across years and months.\n"
         "\n\n"
-        "CRITICAL FORMATTING RULE:\n"
-        "Every time you execute a SQL query using duckdb_query for DATA queries, you MUST:\n"
-        "1. BEFORE calling the tool, briefly explain your reasoning (1-2 sentences)\n"
+        "FORMATTING GUIDELINE:\n"
+        "When executing a SQL query using duckdb_query for DATA queries, please:\n"
+        "1. Briefly explain your reasoning (1-2 sentences)\n"
         "2. Call the tool with the 'plan' parameter containing a detailed implementation plan that includes:\n"
         "   - Which table(s) you selected and why\n"
         "   - What columns or aggregations you're using\n"
         "   - Any JOINs, filters (WHERE), or groupings and the reasoning behind them\n"
         "   - Why you chose this approach (e.g., performance, data accuracy)\n"
         "3. Include the SQL query in a ```sql code block in your response\n"
-        "4. Show the results below the SQL block\n"
-        "This is MANDATORY for all data queries. Metadata queries don't need detailed plans.\n"
+        "4. Show the results below the SQL block formatted as a Markdown table. "
+        "You MUST use the standard Markdown table format with a header row, "
+        "a separator row (e.g. |---|---|), and outer pipes (e.g. | col1 | col2 |).\n"
+        "   - ALWAYS include a header row with column names.\n"
+        "   - ALWAYS include the separator row.\n"
+        "   - Even if there is only one row of results, format it as a table.\n"
+        "This is required for all data queries. Metadata queries don't need detailed plans.\n"
         "\n\n"
         "WORKFLOW FOR DATA QUERIES:\n"
         "When a user asks about data (not just metadata), follow these steps:\n"
         "1. FIRST: Use duckdb_schema to check what tables exist and their columns\n"
         "2. THEN: Use the duckdb_query tool to execute a SQL query against the database\n"
-        "3. Add a LIMIT clause (default LIMIT 10) ONLY for queries that return multiple rows\n"
+        "   - Use output_format='table' in the tool call to get pre-formatted tables.\n"
+        "3. Add a LIMIT clause (default LIMIT 20) ONLY for queries that return multiple rows\n"
         "   (e.g., SELECT * FROM table)\n"
+
+        "\n"
+        "COHORT QUERIES (IMPORTANT):\n"
+        "If the user asks for a cohort based on a customer's FIRST-EVER order month, you MUST compute "
+        "the first order date over ALL orders first (do NOT apply the month filter before computing first order).\n"
+        "Correct pattern:\n"
+        "- CTE first_order AS (SELECT customer_id, MIN(order_date) AS first_order_date "
+        "FROM orders GROUP BY customer_id)\n"
+        "- CTE nov_customers AS (SELECT DISTINCT customer_id FROM orders "
+        "WHERE order_date in Nov-2025 AND other filters)\n"
+        "- Final: JOIN nov_customers -> first_order; cohort = strftime(first_order_date, '%Y-%m'); "
+        "GROUP BY cohort; ORDER BY cohort\n"
         "   - DO NOT add LIMIT for aggregation queries (COUNT, SUM, AVG, MAX, MIN, GROUP BY, etc.)\n"
         "   - Aggregations already return a small result set\n"
         "4. In your response, FIRST show the SQL in a ```sql code block\n"
@@ -670,10 +1035,15 @@ def create_duckdb_agent(
         "   - For large numbers (> 1,000,000), do not show decimals (e.g., 1,234,567)\n"
         "   - For other decimal numbers, limit to 2 decimal places (e.g., 123.45)\n"
         "   - Use thousands separators for readability where appropriate\n"
+        "9. Show the data directly. Avoid asking for permission to show results.\n"
+        "   - If the user asks for a list, show the list.\n"
+        "   - If the user asks for a count, show the count.\n"
+        "   - Avoid saying 'I can show you the results' - just show them.\n"
+        "   - Avoid saying 'The results are available' - display them in the table format.\n"
         "\n"
         "Example workflows:\n"
         "User asks: 'Show me the delivery methods'\n"
-        "Your response MUST be:\n"
+        "Your response should be:\n"
         "```sql\n"
         "SELECT * FROM delivery_methods LIMIT 10\n"
         "```\n"
@@ -685,14 +1055,14 @@ def create_duckdb_agent(
         "User asks: 'How many orders?'\n"
         "Step 1: Check schema for tables containing 'order'\n"
         "Step 2: Write SQL using the correct table name\n"
-        "Your response MUST be:\n"
+        "Your response should be:\n"
         "```sql\n"
         "SELECT COUNT(*) FROM orders\n"
         "```\n"
         "117381\n"
         "\n"
         "User asks: 'Orders per status?'\n"
-        "Your response MUST be:\n"
+        "Your response should be:\n"
         "```sql\n"
         "SELECT status, COUNT(*) as order_count FROM orders GROUP BY status\n"
         "```\n"
@@ -701,7 +1071,7 @@ def create_duckdb_agent(
         "| 0 | 12295 |\n"
         "| 8 | 101937 |\n"
         "\n"
-        "NEVER just show the result without the SQL. Always show both.\n"
+        "Do not just show the result without the SQL. Always show both.\n"
         "\n\n"
         "DATABASE CONTEXT:\n"
         "- The active project and database are already selected for you\n"
@@ -728,7 +1098,7 @@ def create_duckdb_agent(
         "- REGEX FUNCTIONS: Use 'regexp_matches(string, pattern)' instead of 'regexp_match'.\n"
         "\n\n"
         "DOCUMENTATION UPDATES:\n"
-        "If the user provides metadata, descriptions, or a data dictionary (e.g., from an uploaded file):\n"
+        "If the user provides metadata, descriptions, or a data dictionary (e.g., from an uploaded file or image):\n"
         "1. FIRST: Check the actual database schema using duckdb_schema(action='list_fields', table_name='...')\n"
         "   to see ALL fields in the table (both documented and undocumented).\n"
         "2. Parse the user-provided information to identify field names and descriptions.\n"
@@ -736,15 +1106,21 @@ def create_duckdb_agent(
         "4. Use duckdb_schema(action='update_fields_batch') to SAVE/CREATE documentation for ALL matching fields.\n"
         "5. IMPORTANT: The update_field/update_fields_batch actions will CREATE field documentation\n"
         "   if it doesn't exist yet. You CAN document fields that exist in the database but aren't in the schema.\n"
-        "6. Do NOT just list the metadata in the chat; persist it to the schema.\n"
-        "7. Example workflow:\n"
+        "6. DATA TYPE INFERENCE: When updating field documentation:\n"
+        "   - The system will automatically sample actual data from the database to infer accurate data types\n"
+        "   - You can provide a data_type if you know it, but generic types like 'VARCHAR' will be refined\n"
+        "   - For example, if field values look like UUIDs, the system will detect and use 'UUID' type\n"
+        "   - This ensures data types are based on actual data patterns, not just user descriptions\n"
+        "7. Do NOT just list the metadata in the chat; persist it to the schema.\n"
+        "8. Example workflow:\n"
         "   a) User uploads Excel with field descriptions for 'members' table\n"
         "   b) Call: duckdb_schema(action='list_fields', table_name='members') to see all fields\n"
         "   c) Match Excel data to actual field names (handle spacing, underscores, etc.)\n"
         "   d) Call: duckdb_schema(action='update_fields_batch', table_name='members', "
         "fields_json='[{\"name\": \"contact_civility_title\", \"short_description\": \"Civility title\"}, "
         "{\"name\": \"email\", \"short_description\": \"User email\"}]')\n"
-        "   e) Report: 'Updated documentation for 2 fields in members table'\n"
+        "   e) The system will automatically sample data to detect types (e.g., UUID fields)\n"
+        "   f) Report: 'Updated documentation for 2 fields in members table'\n"
     )
 
     agent = DirectOpenAIAgent(
@@ -755,6 +1131,7 @@ def create_duckdb_agent(
         chart_tool=chart_tool,
         system_prompt=system_prompt,
         max_iterations=max_steps,
+        max_history_messages=20,  # Keep last 20 messages to prevent token overflow
     )
 
     # Store tool references for backward compatibility

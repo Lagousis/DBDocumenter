@@ -6,6 +6,7 @@ export interface ProjectInfo {
   description: string;
   is_active: boolean;
   version?: string;
+  query_instructions?: string;
 }
 
 export interface ProjectUpdateRequest {
@@ -13,11 +14,13 @@ export interface ProjectUpdateRequest {
   display_name?: string;
   description?: string;
   version?: string;
+  query_instructions?: string;
 }
 
 export interface ProjectCreateRequest {
   name: string;
   description?: string;
+  query_instructions?: string;
 }
 
 export interface QueryResponse {
@@ -36,6 +39,7 @@ export interface QueryRecord {
   description?: string | null;
   sql: string;
   limit?: number | null;
+  updated_at?: string | null;
 }
 
 export interface QuerySaveRequest {
@@ -67,6 +71,7 @@ export interface FieldUpdateRequest {
   data_type?: string | null;
   values?: Record<string, string> | null;
   relationships?: RelationshipPayload[];
+  ignored?: boolean;
 }
 
 export interface FieldUpdateResponse {
@@ -132,6 +137,7 @@ export interface ChatRequest {
   file_content?: string;
   filename?: string;
   session_id?: string;
+  images?: Array<{ data: string; name: string }>;
 }
 
 export interface ChatResponse {
@@ -189,6 +195,7 @@ export interface DiagramTablePosition {
   name: string;
   x: number;
   y: number;
+  width?: number;
 }
 
 export interface DiagramRecord {
@@ -294,9 +301,9 @@ export interface TableStats {
 }
 
 export interface DatabaseStatsResponse {
+  database_size_bytes: number;
+  database_size_pretty: string;
   tables: TableStats[];
-  total_size_bytes?: number | null;
-  total_size_pretty?: string | null;
 }
 
 export interface ReclaimSpaceRequest {
@@ -307,10 +314,10 @@ export interface ReclaimSpaceRequest {
 export interface ReclaimSpaceResponse {
   success: boolean;
   message: string;
-  old_size_bytes?: number | null;
-  new_size_bytes?: number | null;
-  freed_bytes?: number | null;
-  freed_pretty?: string | null;
+  original_size_bytes: number;
+  new_size_bytes: number;
+  reclaimed_bytes: number;
+  reclaimed_pretty: string;
 }
 
 export interface QueryAssistRequest {
@@ -321,4 +328,16 @@ export interface QueryAssistRequest {
 
 export interface QueryAssistResponse {
   sql: string;
+}
+
+export interface QueryErrorAssistRequest {
+  sql: string;
+  error: string;
+  project?: string;
+  database?: string;
+}
+
+export interface QueryErrorAssistResponse {
+  explanation: string;
+  fixed_sql: string;
 }

@@ -39,8 +39,35 @@
       <QueryConsole v-if="activeTab && activeTab.type === 'query'" :tab="activeTab" />
       <ERDiagram v-else-if="activeTab && activeTab.type === 'diagram'" :tab="activeTab" />
       <ChartViewer v-else-if="activeTab && activeTab.type === 'chart'" :tab="activeTab" />
-      <div v-else-if="activeTab && activeTab.type === 'markdown'" class="markdown-viewer">
-        <div class="markdown-content" v-html="renderMarkdown(activeTab.content)"></div>
+      <div v-else-if="activeTab && activeTab.type === 'markdown'" class="markdown-viewer-container">
+        <div class="markdown-toolbar">
+          <button class="toolbar-btn" @click="exportMarkdown(activeTab)" title="Download Markdown">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            Markdown
+          </button>
+          <button class="toolbar-btn" @click="exportHtml(activeTab)" title="Download HTML">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="16 18 22 12 16 6"></polyline>
+              <polyline points="8 6 2 12 8 18"></polyline>
+            </svg>
+            HTML
+          </button>
+          <button class="toolbar-btn" @click="printMarkdown" title="Print / Save as PDF">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 6 2 18 2 18 9"></polyline>
+              <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
+              <rect x="6" y="14" width="12" height="8"></rect>
+            </svg>
+            Print / PDF
+          </button>
+        </div>
+        <div class="markdown-viewer">
+          <div class="markdown-content" v-html="renderMarkdown(activeTab.content)"></div>
+        </div>
       </div>
       <div v-else class="empty-state">Use the controls above to open a SQL query or ER diagram.</div>
     </div>
@@ -48,6 +75,7 @@
 </template>
 
 <script setup lang="ts">
+import { marked } from "marked";
 import { storeToRefs } from "pinia";
 import { computed, watch } from "vue";
 
@@ -115,81 +143,65 @@ function tabLabel(tab: WorkspaceTab): string {
 }
 
 function renderMarkdown(text: string): string {
-  // Handle code blocks first (before escaping HTML)
-  const codeBlocks: string[] = [];
-  let processedText = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (match, lang, code) => {
-    const placeholder = `___CODE_BLOCK_${codeBlocks.length}___`;
-    const language = lang || 'text';
-    const escapedCode = escapeHtml(code.trim());
-    codeBlocks.push(`<pre class="code-block ${language}"><code>${escapedCode}</code></pre>`);
-    return placeholder;
-  });
-  
-  // Now escape the rest of the text (but preserve placeholders)
-  const parts = processedText.split(/(___CODE_BLOCK_\d+___)/);
-  let html = parts.map((part, index) => {
-    // Don't escape placeholders
-    if (part.startsWith('___CODE_BLOCK_')) {
-      return part;
-    }
-    return escapeHtml(part);
-  }).join('');
-  
-  // Restore code blocks BEFORE processing other markdown
-  codeBlocks.forEach((block, index) => {
-    html = html.replace(`___CODE_BLOCK_${index}___`, `\n${block}\n`);
-  });
-  
-  // Headers
-  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  
-  // Bold: **text** or __text__
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
-  
-  // Italic: *text* or _text_ (but not inside words)
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  html = html.replace(/\b_(.+?)_\b/g, '<em>$1</em>');
-  
-  // Inline code: `text`
-  html = html.replace(/`(.+?)`/g, '<code class="inline-code">$1</code>');
-  
-  // Lists
-  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/^• (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/(<li>.*?<\/li>\n?)+/g, '<ul>$&</ul>');
-  
-  // Protect code blocks from paragraph wrapping
-  const protectedBlocks: string[] = [];
-  html = html.replace(/(<pre class="code-block[^>]*>[\s\S]*?<\/pre>)/g, (match) => {
-    const id = `___PROTECTED_${protectedBlocks.length}___`;
-    protectedBlocks.push(match);
-    return id;
-  });
-  
-  // Line breaks (convert double newlines to paragraphs, single to <br>)
-  html = html.replace(/\n\n/g, '</p><p>');
-  html = html.replace(/\n/g, '<br>');
-  html = '<p>' + html + '</p>';
-  
-  // Remove empty paragraphs
-  html = html.replace(/<p><\/p>/g, '');
-  html = html.replace(/<p><br><\/p>/g, '');
-  
-  // Restore protected blocks
-  protectedBlocks.forEach((block, index) => {
-    html = html.replace(`___PROTECTED_${index}___`, block);
-  });
-  
-  return html;
+  try {
+    return marked.parse(text) as string;
+  } catch (e) {
+    console.error("Markdown parsing failed", e);
+    return text;
+  }
 }
 
-function escapeHtml(text: string): string {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
+function exportMarkdown(tab: WorkspaceTab) {
+  if (tab.type !== "markdown") return;
+  const blob = new Blob([tab.content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${tab.title.replace(/\s+/g, "_")}.md`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function exportHtml(tab: WorkspaceTab) {
+  if (tab.type !== "markdown") return;
+  const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${tab.title}</title>
+<style>
+body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 2rem; color: #333; }
+h1, h2, h3 { color: #111; margin-top: 1.5em; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background-color: #f5f5f5; }
+code { background: #f5f5f5; padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; border-radius: 5px; }
+pre code { background: transparent; padding: 0; }
+blockquote { border-left: 4px solid #ddd; margin: 0; padding-left: 1rem; color: #666; }
+img { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+${renderMarkdown(tab.content)}
+</body>
+</html>`;
+  
+  const blob = new Blob([htmlContent], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${tab.title.replace(/\s+/g, "_")}.html`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function printMarkdown() {
+  window.print();
 }
 </script>
 
@@ -306,6 +318,42 @@ function escapeHtml(text: string): string {
   text-align: center;
 }
 
+.markdown-viewer-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.markdown-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
+  flex-shrink: 0;
+}
+
+.toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid #cbd5f5;
+  background: #ffffff;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: #475569;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.toolbar-btn:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+
 .markdown-viewer {
   flex: 1;
   overflow-y: auto;
@@ -392,5 +440,56 @@ function escapeHtml(text: string): string {
 
 .markdown-content :deep(li) {
   margin: 0.25rem 0;
+}
+
+.markdown-content :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.9rem;
+}
+
+.markdown-content :deep(th),
+.markdown-content :deep(td) {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #e2e8f0;
+  text-align: left;
+}
+
+.markdown-content :deep(th) {
+  background-color: #f8fafc;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.markdown-content :deep(tr:nth-child(even)) {
+  background-color: #fcfcfc;
+}
+
+.markdown-content :deep(code) {
+  background: #f1f5f9;
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.25rem;
+  font-family: 'Courier New', monospace;
+  font-size: 0.875em;
+  color: #b26a45;
+}
+
+.markdown-content :deep(pre) {
+  background: #1e293b;
+  color: #e2e8f0;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+  font-family: 'Courier New', monospace;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.markdown-content :deep(pre code) {
+  background: transparent;
+  padding: 0;
+  color: inherit;
 }
 </style>

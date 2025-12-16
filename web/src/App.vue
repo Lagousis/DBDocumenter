@@ -27,9 +27,7 @@
                 {{ project.subdirectory ? `${project.subdirectory}/` : '' }}{{ project.display_name || project.name }}{{ project.version ? ` (v${project.version})` : '' }}
               </option>
             </select>
-            <svg class="project-select__icon" width="12" height="8" viewBox="0 0 12 8" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M10.5 1.5L6 6 1.5 1.5" stroke="#9A6432" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
+            <span class="project-select__icon" style="color: #9A6432; font-size: 0.7rem;">&#9660;</span>
           </div>
           <button
             type="button"
@@ -42,6 +40,28 @@
             <span aria-hidden="true">&#9998;</span>
             <span class="sr-only">Edit project details</span>
           </button>
+        </div>
+        <div class="generate-menu">
+                      <button
+              type="button"
+              class="sidebar-toggle generate-toggle"
+              title="Generate documentation or export"
+              :disabled="!activeProject"
+              :aria-expanded="showGenerateDropdown"
+              @click="toggleGenerateDropdown"
+            >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="16" y1="13" x2="8" y2="13"></line>
+              <line x1="16" y1="17" x2="8" y2="17"></line>
+              <polyline points="10 9 9 9 8 9"></polyline>
+            </svg>
+          </button>
+          <div v-if="showGenerateDropdown" class="dropdown-menu">
+            <button type="button" @click="handleGenerateDocumentation">Documentation</button>
+            <button type="button" @click="handleExportLLM">JSON Export</button>
+          </div>
         </div>
       </div>
       <div class="header-actions">
@@ -139,6 +159,7 @@
       :initial-name="projectDialogInitialName"
       :initial-description="projectDialogInitialDescription"
       :initial-version="projectDialogInitialVersion"
+      :initial-query-instructions="projectDialogInitialQueryInstructions"
       :loading="projectDialogSaving"
       :error="projectDialogError"
       @close="handleProjectDialogClose"
@@ -163,6 +184,7 @@
       @refresh="refreshQueryLibrary"
       @select="handleQuerySelect"
       @delete="handleQueryDelete"
+      @update="handleQueryUpdate"
     />
     <SyncDialog
       :is-open="syncDialogVisible"
@@ -176,6 +198,7 @@
 import { storeToRefs } from "pinia";
 import { onMounted, onUnmounted, ref, watch } from "vue";
 
+import { exportProjectLLM, fetchProjectDocumentation } from "./api/client";
 import ChatPanel from "./components/ChatPanel.vue";
 import DiagramLibraryDialog from "./components/DiagramLibraryDialog.vue";
 import ProjectEditorDialog from "./components/ProjectEditorDialog.vue";
@@ -200,6 +223,7 @@ const {
   projectDialogInitialName,
   projectDialogInitialDescription,
   projectDialogInitialVersion,
+  projectDialogInitialQueryInstructions,
   diagrams,
   diagramsLoading,
   diagramError: storeDiagramError,
@@ -217,6 +241,7 @@ const diagramLibraryError = ref("");
 const queryLibraryVisible = ref(false);
 const queryLibraryError = ref("");
 const syncDialogVisible = ref(false);
+const showGenerateDropdown = ref(false);
 
 watch(projectDialogOpen, (open) => {
   if (open) {
@@ -357,6 +382,66 @@ async function handleQueryDelete(queryId: string): Promise<void> {
   }
 }
 
+async function handleQueryUpdate(payload: { id: string; name: string; description: string }): Promise<void> {
+  try {
+    // We need to find the query to get its SQL and limit, as saveQuery requires them
+    const query = queries.value.find(q => q.id === payload.id);
+    if (!query) {
+      throw new Error("Query not found");
+    }
+    
+    // We use saveQueryApi directly via sessionStore action if available, or we might need to add a specific update action
+    // But saveQueryForTab is tied to a tab. We should probably add updateQueryRecord to sessionStore.
+    // For now, let's use the existing saveQuery API but we need to be careful.
+    // Actually, sessionStore.saveQueryForTab is for tabs.
+    // Let's check sessionStore for a generic save/update method.
+    // It seems sessionStore.saveQueryForTab is the main one.
+    // I should add updateQueryRecord to sessionStore.
+    
+    await sessionStore.updateQueryRecord(payload.id, payload.name, payload.description);
+  } catch (error) {
+    queryLibraryError.value = error instanceof Error ? error.message : "Failed to update query.";
+  }
+}
+
+function toggleGenerateDropdown() {
+  showGenerateDropdown.value = !showGenerateDropdown.value;
+}
+
+async function handleGenerateDocumentation() {
+  showGenerateDropdown.value = false;
+  if (!activeProject.value) return;
+  
+  try {
+    const { markdown } = await fetchProjectDocumentation(activeProject.value);
+    sessionStore.openMarkdownTab("Documentation", markdown);
+  } catch (e) {
+    console.error("Failed to generate documentation", e);
+    alert("Failed to generate documentation: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
+
+async function handleExportLLM() {
+  showGenerateDropdown.value = false;
+  if (!activeProject.value) return;
+  
+  try {
+    const data = await exportProjectLLM(activeProject.value);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeProject.value}-llm-export.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error("Failed to export JSON", e);
+    alert("Failed to export JSON: " + (e instanceof Error ? e.message : String(e)));
+  }
+}
+
 function beginSchemaResize(event: MouseEvent) {
   event.preventDefault();
   isSchemaResizing.value = true;
@@ -399,7 +484,12 @@ onUnmounted(() => {
   }
 });
 
-async function handleProjectDialogSubmit(payload: { name: string; description: string; version: string }): Promise<void> {
+async function handleProjectDialogSubmit(payload: {
+  name: string;
+  description: string;
+  version: string;
+  query_instructions: string;
+}): Promise<void> {
   if (projectDialogSaving.value) {
     return;
   }
@@ -407,9 +497,14 @@ async function handleProjectDialogSubmit(payload: { name: string; description: s
   projectDialogError.value = "";
   try {
     if (projectDialogMode.value === "create") {
-      await sessionStore.createProjectEntry(payload.name, payload.description);
+      await sessionStore.createProjectEntry(payload.name, payload.description, payload.query_instructions);
     } else {
-      await sessionStore.updateActiveProjectDetails(payload.name, payload.description, payload.version);
+      await sessionStore.updateActiveProjectDetails(
+        payload.name,
+        payload.description,
+        payload.version,
+        payload.query_instructions,
+      );
     }
     sessionStore.closeProjectDialog();
   } catch (error) {
@@ -443,3 +538,49 @@ async function refreshProjects(): Promise<void> {
   }
 }
 </script>
+
+<style scoped>
+.generate-menu {
+  position: relative;
+  display: inline-block;
+  margin-left: 4px;
+}
+
+.generate-toggle {
+  /* Inherits sidebar-toggle styles */
+}
+
+
+
+.dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  min-width: 160px;
+  background: #ffffff;
+  border: 1px solid #cbd5f5;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  padding: 4px;
+  margin-top: 4px;
+}
+
+.dropdown-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: #334155;
+  font-size: 0.9rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.dropdown-menu button:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+</style>

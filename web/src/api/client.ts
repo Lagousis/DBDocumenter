@@ -25,6 +25,8 @@ import type {
     ProjectUpdateRequest,
     QueryAssistRequest,
     QueryAssistResponse,
+    QueryErrorAssistRequest,
+    QueryErrorAssistResponse,
     QueryRecord,
     QueryRequest,
     QueryResponse,
@@ -283,10 +285,25 @@ export async function assistQuery(payload: QueryAssistRequest): Promise<QueryAss
   return data;
 }
 
+export async function assistQueryError(payload: QueryErrorAssistRequest): Promise<QueryErrorAssistResponse> {
+  const { data } = await api.post<QueryErrorAssistResponse>("/query/assist-error", payload);
+  return data;
+}
+
 export async function deleteField(
   table: string,
   field: string,
   params: { project?: string; database?: string } = {},
 ): Promise<void> {
   await api.delete(`/schema/field/${table}/${field}`, { params });
+}
+
+export async function fetchProjectDocumentation(projectName: string): Promise<{ markdown: string }> {
+  const { data } = await api.get<{ markdown: string }>(`/projects/${encodeURIComponent(projectName)}/documentation`);
+  return data;
+}
+
+export async function exportProjectLLM(projectName: string): Promise<any> {
+  const { data } = await api.get<any>(`/projects/${encodeURIComponent(projectName)}/export/llm`);
+  return data;
 }

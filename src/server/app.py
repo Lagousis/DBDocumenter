@@ -2,8 +2,19 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import ServerSettings
 from .models import (
@@ -31,6 +42,8 @@ from .models import (
     ProjectUpdateRequest,
     QueryAssistRequest,
     QueryAssistResponse,
+    QueryErrorAssistRequest,
+    QueryErrorAssistResponse,
     QueryRecord,
     QueryRequest,
     QueryResponse,
@@ -72,6 +85,16 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     app.state.settings = settings
     app.state.runtime = runtime
 
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        print(f"Validation error on {request.method} {request.url.path}:")
+        print(f"  Errors: {exc.errors()}")
+        print(f"  Body: {exc.body}")
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": exc.errors(), "body": str(exc.body)},
+        )
+
     @app.get("/health")
     async def health_check() -> dict[str, str]:
         # Health check endpoint
@@ -90,6 +113,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 display_name=request.display_name,
                 description=request.description,
                 version=request.version,
+                query_instructions=request.query_instructions,
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -98,7 +122,9 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     @app.post("/projects", response_model=ProjectInfo, status_code=status.HTTP_201_CREATED)
     async def create_project(request: ProjectCreateRequest) -> ProjectInfo:
         try:
-            info = await runtime.create_project(name=request.name, description=request.description or "")
+            info = await runtime.create_project(
+                name=request.name, description=request.description, query_instructions=request.query_instructions
+            )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return ProjectInfo(**info)
@@ -149,6 +175,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 relationships=[rel.dict(by_alias=True) for rel in request.relationships or []],
                 new_field_name=request.new_field_name,
                 allow_null=request.allow_null,
+                ignored=request.ignored,
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -315,6 +342,10 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     @app.post("/query", response_model=QueryResponse)
     async def run_query(request: QueryRequest) -> QueryResponse:
         try:
+            print(
+                f"DEBUG /query: sql={request.sql[:50]}..., project={request.project}, "
+                f"database={request.database}, limit={request.limit}"
+            )
             result = await runtime.run_sql(
                 sql=request.sql,
                 project=request.project,
@@ -322,7 +353,13 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 limit=request.limit,
             )
         except ValueError as exc:
+            print(f"ERROR /query ValueError: {exc}")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:
+            print(f"ERROR /query Exception: {exc}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
         return QueryResponse(
             columns=result.columns,
@@ -343,6 +380,24 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 database=request.database,
             )
             return QueryAssistResponse(sql=sql)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"AI assistance failed: {str(exc)}"
+            ) from exc
+
+    @app.post("/query/assist-error", response_model=QueryErrorAssistResponse)
+    async def assist_query_error(request: QueryErrorAssistRequest) -> QueryErrorAssistResponse:
+        try:
+            result = await runtime.assist_query_error(
+                sql=request.sql,
+                error=request.error,
+                project=request.project,
+                database=request.database,
+            )
+            return QueryErrorAssistResponse(**result)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except Exception as exc:
@@ -384,6 +439,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                     file_content=request.file_content,
                     filename=request.filename,
                     session_id=request.session_id,
+                    images=request.images,
                 ):
                     yield f"data: {json.dumps(chunk)}\n\n"
             except Exception as exc:
@@ -579,6 +635,142 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 detail=f"Enrichment failed: {str(exc)}"
             ) from exc
 
+    @app.get("/projects/{project_name}/documentation")
+    async def get_project_documentation(project_name: str):
+        runtime = app.state.runtime
+        # Ensure project is loaded
+        await runtime._ensure_project_locked(project=project_name, database=None)
+        schema = runtime.schema_manager.schema
+        
+        markdown = f"# Project: {schema.get('project_display_name', project_name)}\n\n"
+        if schema.get('project_description'):
+            markdown += f"{schema['project_description']}\n\n"
+            
+        markdown += f"**Version:** {schema.get('version', '1.0.0')}\n\n"
+        
+        tables = schema.get('tables', {})
+        markdown += "## Tables\n\n"
+        
+        for table_name, table_data in sorted(tables.items()):
+            markdown += f"### {table_name}\n\n"
+            
+            short_desc = table_data.get('short_description', '') or table_data.get('description', '')
+            long_desc = table_data.get('long_description', '')
+            
+            if short_desc:
+                markdown += f"{short_desc}\n\n"
+            if long_desc and long_desc != short_desc:
+                markdown += f"{long_desc}\n\n"
+                
+            fields = table_data.get('fields', {})
+            if fields:
+                markdown += "| Field | Type | Nullable | Description |\n"
+                markdown += "| --- | --- | --- | --- |\n"
+                
+                for field_name, field_data in fields.items():
+                    dtype = field_data.get('data_type', 'UNKNOWN')
+                    nullable = "Yes" if field_data.get('allow_null', True) else "No"
+                    
+                    short_desc = field_data.get('short_description', '') or field_data.get('description', '')
+                    long_desc = field_data.get('long_description', '')
+                    
+                    desc_parts = []
+                    if short_desc:
+                        desc_parts.append(short_desc)
+                    if long_desc and long_desc != short_desc:
+                        desc_parts.append(long_desc)
+                    
+                    final_desc = " - ".join(desc_parts).replace('\n', ' ')
+                        
+                    markdown += f"| **{field_name}** | {dtype} | {nullable} | {final_desc} |\n"
+                markdown += "\n"
+                
+        markdown += "## Relationships & Coverage\n\n"
+        
+        # Calculate coverage and unmatched values
+        has_relationships = False
+        
+        for table_name, table_data in sorted(tables.items()):
+            relationships = table_data.get('relationships', [])
+            for rel in relationships:
+                field_name = rel.get('field')
+                related_table = rel.get('related_table')
+                related_field = rel.get('related_field')
+                
+                if not field_name or not related_table or not related_field:
+                    continue
+                
+                has_relationships = True
+                markdown += f"### {table_name}.{field_name} -> {related_table}.{related_field}\n\n"
+                
+                # Calculate coverage
+                try:
+                    # Coverage query
+                    count_sql = f"""
+                        SELECT 
+                            COUNT(*) as total,
+                            SUM(CASE WHEN "{field_name}" IN (
+                                SELECT "{related_field}" FROM "{related_table}" WHERE "{related_field}" IS NOT NULL
+                            ) THEN 1 ELSE 0 END) as matched
+                        FROM "{table_name}"
+                        WHERE "{field_name}" IS NOT NULL AND CAST("{field_name}" AS VARCHAR) != ''
+                    """
+                    res = runtime.query_tool.execute_structured(count_sql)
+                    if res.rows and res.rows[0]:
+                        total = res.rows[0][0] or 0
+                        matched = res.rows[0][1] or 0
+                        coverage = (matched / total * 100) if total > 0 else 100
+                        markdown += f"- **Coverage:** {coverage:.2f}% ({matched}/{total})\n"
+                        
+                        if coverage < 100:
+                            # Unmatched values query
+                            unmatched_sql = f"""
+                                SELECT DISTINCT "{field_name}"
+                                FROM "{table_name}"
+                                WHERE "{field_name}" IS NOT NULL 
+                                  AND CAST("{field_name}" AS VARCHAR) != ''
+                                  AND "{field_name}" NOT IN (
+                                    SELECT "{related_field}" 
+                                    FROM "{related_table}" 
+                                    WHERE "{related_field}" IS NOT NULL
+                                  )
+                                LIMIT 10
+                            """
+                            res_unmatched = runtime.query_tool.execute_structured(unmatched_sql)
+                            if res_unmatched.rows:
+                                markdown += "- **Top Unmatched Values:**\n"
+                                for row in res_unmatched.rows:
+                                    markdown += f"  - `{row[0]}`\n"
+                except Exception as e:
+                    markdown += f"- **Error calculating coverage:** {str(e)}\n"
+                
+                markdown += "\n"
+        
+        if not has_relationships:
+            markdown += "No relationships defined.\n"
+
+        return {"markdown": markdown}
+
+    @app.get("/projects/{project_name}/export/llm")
+    async def export_project_llm(project_name: str):
+        runtime = app.state.runtime
+        await runtime._ensure_project_locked(project=project_name, database=None)
+        schema = runtime.schema_manager.schema.copy()
+        
+        # Remove unnecessary fields
+        if 'diagrams' in schema:
+            del schema['diagrams']
+        if 'queries' in schema:
+            del schema['queries']
+            
+        # Clean up tables
+        if 'tables' in schema:
+            for table_data in schema['tables'].values():
+                if 'layout' in table_data:
+                    del table_data['layout']
+                # Maybe remove other UI specific fields if any
+                
+        return schema
     return app
 
 

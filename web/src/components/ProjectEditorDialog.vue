@@ -24,6 +24,15 @@
           </label>
 
           <label class="block">
+            <span class="label">Query Instructions</span>
+            <textarea
+              v-model="form.query_instructions"
+              rows="4"
+              placeholder="Specific instructions for the LLM when generating queries (e.g., 'Always use CTEs', 'Prefer specific naming conventions')."
+            />
+          </label>
+
+          <label class="block">
             <span class="label">Version</span>
             <input v-model.trim="form.version" type="text" placeholder="e.g., 1.0.0" />
           </label>
@@ -59,6 +68,7 @@ interface Props {
   initialName: string;
   initialDescription: string;
   initialVersion?: string;
+  initialQueryInstructions?: string;
   loading?: boolean;
   error?: string;
 }
@@ -66,24 +76,36 @@ interface Props {
 const props = defineProps<Props>();
 const emit = defineEmits<{
   (e: "close"): void;
-  (e: "submit", payload: { name: string; description: string; version: string }): void;
+  (
+    e: "submit",
+    payload: { name: string; description: string; version: string; query_instructions: string },
+  ): void;
 }>();
 
 const form = reactive({
   name: props.initialName,
   description: props.initialDescription ?? "",
   version: props.initialVersion ?? "",
+  query_instructions: props.initialQueryInstructions ?? "",
 });
 
 const dbInfoVisible = ref(false);
 
 watch(
-  () => [props.initialName, props.initialDescription, props.initialVersion, props.visible] as const,
-  ([name, description, version, visible]) => {
+  () =>
+    [
+      props.initialName,
+      props.initialDescription,
+      props.initialVersion,
+      props.initialQueryInstructions,
+      props.visible,
+    ] as const,
+  ([name, description, version, query_instructions, visible]) => {
     if (visible) {
       form.name = name;
       form.description = description ?? "";
       form.version = version ?? "";
+      form.query_instructions = query_instructions ?? "";
     }
   },
 );
@@ -110,6 +132,7 @@ function handleSubmit(): void {
     name: form.name.trim(),
     description: form.description,
     version: form.version.trim(),
+    query_instructions: form.query_instructions,
   });
 }
 
