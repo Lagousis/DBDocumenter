@@ -732,8 +732,12 @@ class SchemaManager:
             lines.append(f"  {table_name} {{")
             fields = record.get("fields", {})
             for field_name, metadata in fields.items():
-                data_type = metadata.get("data_type") or "UNKNOWN"
+                # Only include fields that have documentation
                 short_desc = metadata.get("short_description") or ""
+                long_desc = metadata.get("long_description") or ""
+                if not short_desc and not long_desc:
+                    continue
+                data_type = metadata.get("data_type") or "UNKNOWN"
                 lines.append(f"    {data_type} {field_name} \"{short_desc}\"")
             lines.append("  }")
 

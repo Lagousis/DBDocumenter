@@ -169,7 +169,11 @@
               </button>
             </div>
             
-            <div v-if="!loadingValues && (nullCount !== null || emptyCount !== null)" class="stats-row">
+            <div v-if="!loadingValues && (nullCount !== null || emptyCount !== null || nonNullCount !== null)" class="stats-row">
+              <div class="stat-item" v-if="nonNullCount !== null">
+                <span class="stat-label">Non-NULL:</span>
+                <span class="stat-value">{{ nonNullCount }}</span>
+              </div>
               <div class="stat-item" v-if="nullCount !== null">
                 <span class="stat-label">NULLs:</span>
                 <span class="stat-value">{{ nullCount }}</span>
@@ -212,7 +216,10 @@
           <button type="button" class="secondary-button ai-button" :disabled="generatingAI" @click="handleAIAssist">
             <span>{{ generatingAI ? "Generating..." : "✨ AI Assist" }}</span>
           </button>
-          <button type="button" class="secondary-button danger" :disabled="saving" @click="handleDelete">Delete from schema</button>
+          <button v-if="generatingAI" type="button" class="secondary-button danger" @click="handleCancelAI">
+            Stop
+          </button>
+          <button type="button" class="secondary-button danger" :disabled="saving || generatingAI" @click="handleDelete">Delete from schema</button>
           <div style="flex: 1;"></div>
           <button type="button" class="secondary-button" @click="handleClose">Cancel</button>
           <button type="button" class="secondary-button" :disabled="saving" @click="handleSave">
@@ -245,7 +252,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
 
-import { aiAssistField, deleteField, runQuery, updateFieldMetadata } from "../api/client";
+import { aiAssistField, cancelAIAssist, deleteField, runQuery, updateFieldMetadata } from "../api/client";
 import { useSessionStore } from "../stores/session";
 import type { AIAssistFieldRequest, FieldUpdateRequest, RelationshipPayload } from "../types/api";
 import UnmatchedValuesDialog from "./UnmatchedValuesDialog.vue";
@@ -317,6 +324,7 @@ const distinctValues = ref<DistinctValue[]>([]);
 const loadingValues = ref(false);
 const nullCount = ref<number | null>(null);
 const emptyCount = ref<number | null>(null);
+const nonNullCount = ref<number | null>(null);
 
 const showUnmatchedDialog = ref(false);
 const unmatchedValues = ref<{ value: string; count: number }[]>([]);
@@ -544,6 +552,7 @@ async function fetchDistinctValues() {
   loadingValues.value = true;
   nullCount.value = null;
   emptyCount.value = null;
+  nonNullCount.value = null;
 
   try {
     const sqlDistinct = `
@@ -555,6 +564,7 @@ async function fetchDistinctValues() {
     `;
     const sqlCounts = `
       SELECT 
+        SUM(CASE WHEN "${props.field}" IS NOT NULL THEN 1 ELSE 0 END) as non_null_count,
         SUM(CASE WHEN "${props.field}" IS NULL THEN 1 ELSE 0 END) as null_count,
         SUM(CASE WHEN CAST("${props.field}" AS VARCHAR) = '' THEN 1 ELSE 0 END) as empty_count
       FROM "${props.table}"
@@ -581,8 +591,9 @@ async function fetchDistinctValues() {
     }
 
     if (countsRes.rows && countsRes.rows.length > 0) {
-      nullCount.value = Number(countsRes.rows[0][0]);
-      emptyCount.value = Number(countsRes.rows[0][1]);
+      nonNullCount.value = Number(countsRes.rows[0][0]);
+      nullCount.value = Number(countsRes.rows[0][1]);
+      emptyCount.value = Number(countsRes.rows[0][2]);
     }
   } catch (e) {
     console.error("Failed to fetch values", e);
@@ -704,6 +715,15 @@ async function handleAIAssist() {
   }
 }
 
+async function handleCancelAI() {
+  try {
+    await cancelAIAssist();
+    console.log("AI assist cancelled");
+  } catch (error) {
+    console.error("Failed to cancel AI assist:", error);
+  }
+}
+
 async function handleDelete() {
   if (!props.table || !props.field) return;
   if (!window.confirm(`Are you sure you want to delete the field "${props.field}" from the schema documentation for table "${props.table}"? This will NOT remove the column from the database, only from the documentation.`)) {
@@ -785,7 +805,7 @@ function handleClose() {
 }
 
 .values-sidebar {
-  width: 300px;
+  width: 380px;
   border-left: 1px solid rgba(178, 106, 69, 0.2);
   background: rgba(253, 248, 241, 0.5);
   display: flex;

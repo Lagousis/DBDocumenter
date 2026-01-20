@@ -270,6 +270,18 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 detail=f"AI assist failed: {str(exc)}"
             ) from exc
 
+    @app.post("/schema/field/ai-assist/cancel")
+    async def cancel_ai_assist() -> dict:
+        try:
+            await runtime.cancel_agent()
+            return {"status": "cancelled"}
+        except Exception as exc:
+            print(f"Error cancelling AI assist: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to cancel operation"
+            ) from exc
+
     @app.get("/diagrams", response_model=list[DiagramRecord])
     async def list_diagrams(project: Optional[str] = None, database: Optional[str] = None) -> list[DiagramRecord]:
         diagrams = await runtime.list_diagrams(project=project, database=database)
@@ -668,6 +680,10 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
                 markdown += "| --- | --- | --- | --- |\n"
                 
                 for field_name, field_data in fields.items():
+                    # Skip ignored fields
+                    if field_data.get('ignored', False):
+                        continue
+                    
                     dtype = field_data.get('data_type', 'UNKNOWN')
                     nullable = "Yes" if field_data.get('allow_null', True) else "No"
                     
@@ -768,7 +784,13 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             for table_data in schema['tables'].values():
                 if 'layout' in table_data:
                     del table_data['layout']
-                # Maybe remove other UI specific fields if any
+                # Remove ignored fields
+                if 'fields' in table_data:
+                    table_data['fields'] = {
+                        field_name: field_data
+                        for field_name, field_data in table_data['fields'].items()
+                        if not field_data.get('ignored', False)
+                    }
                 
         return schema
     return app

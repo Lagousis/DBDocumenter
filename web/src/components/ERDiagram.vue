@@ -376,24 +376,31 @@ const diagramData = computed<DiagramData | null>(() => {
   const tablesPayload: DiagramTable[] = tableRecords.map(([tableName, tableData]) => {
     const fieldsMeta = tableData.fields ?? {};
     const entries = Object.entries(fieldsMeta);
-    const fields: DiagramField[] = entries.map(([fieldName, details]) => {
-      const dataType =
-        typeof details?.data_type === "string" && details.data_type
-          ? details.data_type
-          : "string";
-      const key = `${tableName.toLowerCase()}::${fieldName.toLowerCase()}`;
-      const relatedTargets = fieldTargets.get(key) ?? [];
-      const isForeignKey = relatedTargets.length > 0;
-      const destinations = relatedTargets
-        .map((entry) => (entry.field ? `${entry.table}.${entry.field}` : entry.table))
-        .join(", ");
-      return {
-        name: fieldName,
-        type: dataType,
-        isForeignKey,
-        tooltip: isForeignKey ? `References ${destinations}` : undefined,
-      };
-    });
+    const fields: DiagramField[] = entries
+      .filter(([_, details]) => {
+        // Only include fields that have documentation
+        const shortDesc = (details as any)?.short_description ?? "";
+        const longDesc = (details as any)?.long_description ?? "";
+        return shortDesc || longDesc;
+      })
+      .map(([fieldName, details]) => {
+        const dataType =
+          typeof details?.data_type === "string" && details.data_type
+            ? details.data_type
+            : "string";
+        const key = `${tableName.toLowerCase()}::${fieldName.toLowerCase()}`;
+        const relatedTargets = fieldTargets.get(key) ?? [];
+        const isForeignKey = relatedTargets.length > 0;
+        const destinations = relatedTargets
+          .map((entry) => (entry.field ? `${entry.table}.${entry.field}` : entry.table))
+          .join(", ");
+        return {
+          name: fieldName,
+          type: dataType,
+          isForeignKey,
+          tooltip: isForeignKey ? `References ${destinations}` : undefined,
+        };
+      });
     return { name: tableName, fields };
   });
 

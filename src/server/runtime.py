@@ -798,6 +798,11 @@ class DuckDBRuntime:
                 )
         return self._agent
 
+    async def cancel_agent(self) -> None:
+        """Cancel the currently running agent operation."""
+        if self._agent:
+            await asyncio.to_thread(self._agent.cancel)
+
     def _set_agent_project(
         self,
         agent: DirectOpenAIAgent,

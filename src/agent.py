@@ -75,6 +75,7 @@ class DirectOpenAIAgent:
         self._last_implementation_plan: Optional[str] = None
         self.conversation_history: List[Dict[str, Any]] = []
         self.execution_metadata: Dict[str, Any] = {}
+        self._cancelled: bool = False
 
         # Link tools back to agent for SQL/plan capture
         self.query_tool._agent_ref = self  # type: ignore[attr-defined]
@@ -257,6 +258,11 @@ class DirectOpenAIAgent:
         # Reconstruct history: system + recent messages
         self.conversation_history = system_messages + other_messages
 
+    def cancel(self) -> None:
+        """Cancel the current agent execution."""
+        self._cancelled = True
+        print("DEBUG: Cancellation requested")
+
     def run(
         self,
         prompt: str,
@@ -319,9 +325,19 @@ class DirectOpenAIAgent:
 
         # Function calling loop
         for iteration in range(self.max_iterations):
+            # Check for cancellation
+            if self._cancelled:
+                print("DEBUG: Agent execution cancelled by user")
+                self._cancelled = False  # Reset for next run
+                return "Operation cancelled by user."
+            
             api_calls += 1
 
             print(f"DEBUG: Agent iteration {iteration + 1}/{self.max_iterations}")
+            
+            # Notify about iteration progress
+            if on_step and iteration > 0:
+                on_step(f"Processing step {iteration + 1}...")
 
             # Trim conversation history to prevent token limit issues
             self._trim_conversation_history()

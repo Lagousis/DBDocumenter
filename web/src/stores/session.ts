@@ -128,6 +128,7 @@ const STORAGE_SELECTED_TABLE_KEY = "schemaSelectedTable";
 const STORAGE_CHAT_PANEL_KEY = "chatPanelCollapsed";
 const STORAGE_CHAT_WIDTH_KEY = "chatPanelWidth";
 const STORAGE_QUERY_EDITOR_HEIGHT_KEY = "queryEditorHeight";
+const STORAGE_ACTIVE_PROJECT_KEY = "activeProject";
 
 function makeId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -217,6 +218,9 @@ export const useSessionStore = defineStore("session", {
     chatSessionsLoading: false,
     chatSessionsError: "",
     currentSessionId: undefined as string | undefined,
+    draggedTable: null as string | null,
+    chatAbortController: null as AbortController | null,
+    chatStatusMessage: "Thinking..." as string,
   }),
   getters: {
     hasProjects(state): boolean {
@@ -283,9 +287,23 @@ export const useSessionStore = defineStore("session", {
       try {
         const projects = await fetchProjects();
         this.projects = projects;
-        const preferred = projects.find((item) => item.is_active) ?? projects[0];
-        this.activeProject = preferred?.name;
-        this.activeDatabase = preferred?.path;
+        
+        // Try to restore the last selected project from localStorage
+        let selectedProject: ProjectInfo | undefined;
+        if (typeof window !== "undefined") {
+          const storedProjectName = window.localStorage.getItem(STORAGE_ACTIVE_PROJECT_KEY);
+          if (storedProjectName) {
+            selectedProject = projects.find((item) => item.name === storedProjectName);
+          }
+        }
+        
+        // Fall back to the active project or first project if not found
+        if (!selectedProject) {
+          selectedProject = projects.find((item) => item.is_active) ?? projects[0];
+        }
+        
+        this.activeProject = selectedProject?.name;
+        this.activeDatabase = selectedProject?.path;
         this._synchroniseActiveProject(this.activeProject);
       } catch (error) {
         this.errorMessage = error instanceof Error ? error.message : "Failed to load projects.";
@@ -339,6 +357,7 @@ export const useSessionStore = defineStore("session", {
         this._synchroniseActiveProject(undefined);
         if (typeof window !== "undefined") {
           window.localStorage.removeItem(STORAGE_SELECTED_TABLE_KEY);
+          window.localStorage.removeItem(STORAGE_ACTIVE_PROJECT_KEY);
         }
         this.ensureDefaultQueryTab();
         return;
@@ -351,10 +370,14 @@ export const useSessionStore = defineStore("session", {
       this.activeDatabase = match.path;
       this.currentSessionId = undefined;
       this._synchroniseActiveProject(this.activeProject);
-      await this.refreshMetadata();
+      
+      // Persist the selected project to localStorage
       if (typeof window !== "undefined") {
+        window.localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, match.name);
         window.localStorage.removeItem(STORAGE_SELECTED_TABLE_KEY);
       }
+      
+      await this.refreshMetadata();
       this.ensureDefaultQueryTab();
     },
     async updateActiveProjectDetails(
@@ -391,6 +414,12 @@ export const useSessionStore = defineStore("session", {
       this.activeProject = created.name;
       this.activeDatabase = created.path;
       this._synchroniseActiveProject(this.activeProject);
+      
+      // Persist the newly created project to localStorage
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(STORAGE_ACTIVE_PROJECT_KEY, created.name);
+      }
+      
       await this.refreshMetadata();
       this.ensureDefaultQueryTab();
       return created;
@@ -520,6 +549,9 @@ export const useSessionStore = defineStore("session", {
       
       this.loadingChat = true;
       
+      // Create abort controller for this request
+      this.chatAbortController = new AbortController();
+      
       try {
         let finalResponse: ChatResponse = { reply: "", database: undefined };
         
@@ -545,6 +577,7 @@ export const useSessionStore = defineStore("session", {
             if (chunk.type === "status" && chunk.message) {
               // Update the assistant message with status
               assistantEntry.text = chunk.message;
+              this.chatStatusMessage = chunk.message;
             } else if (chunk.type === "response" && chunk.reply) {
               // Update with the actual response
               assistantEntry.text = chunk.reply;
@@ -583,18 +616,35 @@ export const useSessionStore = defineStore("session", {
                 this.currentSessionId = chunk.session_id;
               }
             }
-          }
+          },
+          this.chatAbortController.signal
         );
         
         return finalResponse;
       } catch (error) {
-        // Remove the assistant message on error
+        // Check if this is an abort error (user cancelled)
+        if (error instanceof Error && (error.name === 'AbortError' || error.message.includes('aborted'))) {
+          // User cancelled - update the assistant message instead of removing it
+          assistantEntry.text = "Operation cancelled by user.";
+          return { reply: "Operation cancelled by user.", database: undefined };
+        }
+        
+        // Remove the assistant message on other errors
         const index = this.chatHistory.indexOf(assistantEntry);
         if (index > -1) {
           this.chatHistory.splice(index, 1);
         }
         throw error;
       } finally {
+        this.loadingChat = false;
+        this.chatAbortController = null;
+        this.chatStatusMessage = "Thinking...";
+      }
+    },
+    stopChat(): void {
+      if (this.chatAbortController) {
+        this.chatAbortController.abort();
+        this.chatAbortController = null;
         this.loadingChat = false;
       }
     },
@@ -625,7 +675,7 @@ export const useSessionStore = defineStore("session", {
                     id: makeId(),
                     role: msg.role as "user" | "assistant",
                     text: msg.content,
-                    timestamp: Date.now(), // We don't store per-message timestamp in backend yet
+                    timestamp: msg.timestamp ? msg.timestamp * 1000 : Date.now(), // Convert from seconds to milliseconds
                 }));
             this.currentSessionId = sessionId;
         } catch (error) {
@@ -1046,12 +1096,12 @@ export const useSessionStore = defineStore("session", {
         refreshQueryDirtyFlag(tab);
       }
     },
-    async runQueryForTab(id: string): Promise<QueryResponse> {
+    async runQueryForTab(id: string, overrideSql?: string): Promise<QueryResponse> {
       const tab = this.workspaceTabs.find((item): item is QueryTabState => item.id === id && item.type === "query");
       if (!tab) {
         throw new Error(`Query tab '${id}' not found.`);
       }
-      const sql = tab.sql ?? "";
+      const sql = overrideSql ?? tab.sql ?? "";
       if (!sql.trim()) {
         tab.errorMessage = "Provide a SQL query before executing.";
         throw new Error(tab.errorMessage);

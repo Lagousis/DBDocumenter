@@ -178,7 +178,7 @@
             <span class="dot"></span>
             <span class="dot"></span>
           </div>
-          <span class="loading-text">Thinking...</span>
+          <span class="loading-text">{{ chatStatusMessage }}</span>
         </div>
       </div>
     </div>
@@ -235,8 +235,11 @@
               <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
             </svg>
           </button>
-          <button type="submit" :disabled="loadingChat || !activeProject">
-            {{ loadingChat ? "Thinking..." : "Send" }}
+          <button v-if="!loadingChat" type="submit" :disabled="!activeProject">
+            Send
+          </button>
+          <button v-else type="button" class="stop-btn" @click="stopChat">
+            Stop
           </button>
         </div>
       </div>
@@ -264,7 +267,7 @@ import { useSessionStore } from "../stores/session";
 import ChatHistoryDialog from "./ChatHistoryDialog.vue";
 
 const sessionStore = useSessionStore();
-const { chatHistory, loadingChat, activeProject, chatSessions, chatSessionsLoading, chatSessionsError } = storeToRefs(sessionStore);
+const { chatHistory, loadingChat, activeProject, chatSessions, chatSessionsLoading, chatSessionsError, chatStatusMessage } = storeToRefs(sessionStore);
 const draft = ref("");
 const errorMessage = ref("");
 const expandedSqlBlocks = ref<Set<string>>(new Set());
@@ -303,6 +306,10 @@ function triggerFileSelect() {
 
 function removeFile() {
   selectedFile.value = null;
+}
+
+function stopChat(): void {
+  sessionStore.stopChat();
 }
 
 async function handlePaste(event: ClipboardEvent) {
@@ -492,16 +499,21 @@ function parseTable(tableText: string): MessageBlock | null {
   
   if (lines.length < 2) return null;
 
-  const rows = lines.map(line => 
-    line.split("|")
-      .map(cell => cell.trim())
-      .filter(cell => cell.length > 0) // Remove empty cells from split
-  );
+  const rows = lines.map(line => {
+    // Split by pipe and remove first/last empty elements from outer pipes
+    const cells = line.split("|");
+    // Remove leading empty cell if line starts with |
+    if (cells[0].trim() === "") cells.shift();
+    // Remove trailing empty cell if line ends with |
+    if (cells.length > 0 && cells[cells.length - 1].trim() === "") cells.pop();
+    // Trim each cell but preserve empty cells
+    return cells.map(cell => cell.trim());
+  });
 
   // Check if second line is a separator (contains mostly - and |)
   // Note: rows[1] is the parsed cells of the second line
   const isSeparatorLine = (line: string[]) => 
-    line.every(cell => /^[-:|\s]+$/.test(cell));
+    line.every(cell => /^[-:|\s]*$/.test(cell));
 
   if (rows.length >= 2 && isSeparatorLine(rows[1])) {
     // Markdown-style table with header separator
@@ -579,9 +591,8 @@ function markdownToHtml(text: string): string {
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
   
-  // Italic: *text* or _text_
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  html = html.replace(/_(.+?)_/g, '<em>$1</em>');
+  // Italic: *text* only (removed single underscore support to preserve table names with underscores)
+  html = html.replace(/\*([^\s*][^\*]*?)\*/g, '<em>$1</em>');
   
   // Inline code: `text`
   html = html.replace(/`(.+?)`/g, '<code>$1</code>');
@@ -688,7 +699,7 @@ function clearChat(): void {
 
 function formatTimestamp(timestamp: number): string {
   if (!timestamp) return '';
-  const date = new Date(timestamp * 1000);
+  const date = new Date(timestamp); // timestamp is already in milliseconds
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -784,10 +795,14 @@ async function send(): Promise<void> {
     
     await sessionStore.sendMessage(content, fileData, images.length > 0 ? images : undefined);
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "Chat request failed.";
-    draft.value = content;
-    selectedFile.value = file; // Restore file on error
-    pastedImages.value = images; // Restore images on error
+    // Don't show error message if the operation was cancelled by the user
+    const isCancelled = error instanceof Error && (error.name === 'AbortError' || error.message.includes('cancelled'));
+    if (!isCancelled) {
+      errorMessage.value = error instanceof Error ? error.message : "Chat request failed.";
+      draft.value = content;
+      selectedFile.value = file; // Restore file on error
+      pastedImages.value = images; // Restore images on error
+    }
   }
 }
 
@@ -1798,6 +1813,22 @@ button[type="submit"]:hover {
 button[type="submit"]:disabled {
   background-color: #94a3b8;
   cursor: not-allowed;
+}
+
+.stop-btn {
+  background-color: #ef4444;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background-color 0.2s;
+}
+
+.stop-btn:hover {
+  background-color: #dc2626;
 }
 
 .error {

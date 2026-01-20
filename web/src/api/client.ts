@@ -99,7 +99,8 @@ export async function sendChatStream(
     error?: string; 
     database?: string; 
     metadata?: ChatResponse['metadata'] 
-  }) => void
+  }) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(`${api.defaults.baseURL}/chat/stream`, {
     method: "POST",
@@ -107,6 +108,7 @@ export async function sendChatStream(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal,
   });
 
   if (!response.ok) {
@@ -193,6 +195,10 @@ export async function autoDescribeField(payload: AutoDescribeRequest): Promise<A
 export async function aiAssistField(payload: AIAssistFieldRequest): Promise<AIAssistFieldResponse> {
   const { data } = await api.post<AIAssistFieldResponse>("/schema/field/ai-assist", payload);
   return data;
+}
+
+export async function cancelAIAssist(): Promise<void> {
+  await api.post("/schema/field/ai-assist/cancel");
 }
 
 export async function fetchUndocumentedFields(

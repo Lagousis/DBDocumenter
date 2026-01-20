@@ -214,7 +214,19 @@
           </div>
 
           <div v-if="undocumentedFields.length" class="undocumented">
-            <span class="undocumented-label">Undocumented fields in database</span>
+            <div class="undocumented-header">
+              <span class="undocumented-label">Undocumented fields in database</span>
+              <button
+                type="button"
+                class="ignore-all-button"
+                :disabled="isIgnoringAll"
+                title="Ignore all undocumented fields"
+                @click="ignoreAllUndocumented"
+              >
+                <span v-if="isIgnoringAll" class="spinner"></span>
+                <span v-else>Ignore all</span>
+              </button>
+            </div>
               <div class="undocumented-chips">
                 <button
                 v-for="field in filteredUndocumentedFields"
@@ -309,7 +321,7 @@
 import { storeToRefs } from "pinia";
 import { computed, nextTick, ref, watch } from "vue";
 
-import { fetchUndocumentedFields } from "../api/client";
+import { fetchUndocumentedFields, updateFieldMetadata } from "../api/client";
 import { useSessionStore, type DiagramTabState } from "../stores/session";
 import type { RelationshipPayload, UndocumentedField } from "../types/api";
 import FieldEditorDialog from "./FieldEditorDialog.vue";
@@ -345,6 +357,7 @@ const editorField = ref<string | null>(null);
 const editorMetadata = ref<FieldMetadata | null>(null);
 const undocumentedFields = ref<UndocumentedField[]>([]);
 const fieldSearchTerm = ref("");
+const isIgnoringAll = ref(false);
 
 const isTableEditorOpen = ref(false);
 
@@ -463,6 +476,19 @@ const relationshipSuggestionsForEditor = computed(() => {
   if (!editorField.value) {
     return [];
   }
+  
+  // Get existing relationships for the current field
+  const tableRelationships = (selectedDetails.value?.data?.relationships ?? []) as Array<Record<string, any>>;
+  const fieldLower = editorField.value.toLowerCase();
+  const existingRelationships = new Set<string>();
+  
+  tableRelationships
+    .filter((rel) => typeof rel?.field === "string" && rel.field.toLowerCase() === fieldLower)
+    .forEach((rel) => {
+      const key = `${rel.related_table?.toLowerCase() || ''}::${rel.related_field?.toLowerCase() || ''}`;
+      existingRelationships.add(key);
+    });
+  
   const suggestions: { related_table: string; related_field: string }[] = [];
   const target = editorField.value.toLowerCase();
   for (const [tableName, tableData] of Object.entries(schemaTables.value)) {
@@ -471,7 +497,11 @@ const relationshipSuggestionsForEditor = computed(() => {
     }
     Object.keys(tableData.fields || {}).forEach((fieldName) => {
       if (fieldName.toLowerCase() === target) {
-        suggestions.push({ related_table: tableName, related_field: fieldName });
+        const suggestionKey = `${tableName.toLowerCase()}::${fieldName.toLowerCase()}`;
+        // Only add if this relationship doesn't already exist
+        if (!existingRelationships.has(suggestionKey)) {
+          suggestions.push({ related_table: tableName, related_field: fieldName });
+        }
       }
     });
   }
@@ -668,6 +698,49 @@ async function refreshFields() {
   if (!selectedDetails.value?.name) return;
   await sessionStore.refreshMetadata();
   await loadUndocumented(selectedDetails.value.name);
+}
+
+async function ignoreAllUndocumented() {
+  const tableName = selectedDetails.value?.name;
+  if (!tableName || !undocumentedFields.value.length || isIgnoringAll.value) {
+    return;
+  }
+
+  const fieldCount = undocumentedFields.value.length;
+  const confirmed = confirm(
+    `Are you sure you want to ignore all ${fieldCount} undocumented field${fieldCount > 1 ? 's' : ''} in table "${tableName}"?\n\n` +
+    `Fields to be ignored:\n${undocumentedFields.value.map(f => f.name).join(', ')}`
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  isIgnoringAll.value = true;
+  try {
+    // Update each field to set ignored = true
+    const updatePromises = undocumentedFields.value.map((field) =>
+      updateFieldMetadata({
+        project: sessionStore.activeProject,
+        database: sessionStore.activeDatabase,
+        table: tableName,
+        field: field.name,
+        data_type: field.data_type || undefined,
+        ignored: true,
+      })
+    );
+
+    await Promise.all(updatePromises);
+
+    // Refresh the metadata and reload undocumented fields
+    await sessionStore.refreshMetadata();
+    await loadUndocumented(tableName);
+  } catch (error) {
+    console.error("Failed to ignore all undocumented fields:", error);
+    alert("Failed to ignore fields. Please try again.");
+  } finally {
+    isIgnoringAll.value = false;
+  }
 }
 
 function generateQuery(includeAll: boolean) {
@@ -945,10 +1018,57 @@ function generateQuery(includeAll: boolean) {
   margin-bottom: 0.3rem;
 }
 
+.undocumented-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .undocumented-label {
   font-size: 0.82rem;
   color: #7a6a5d;
   font-weight: 600;
+}
+
+.ignore-all-button {
+  border: 1px solid rgba(178, 106, 69, 0.3);
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+  background: rgba(253, 248, 241, 0.92);
+  color: #a05736;
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+  white-space: nowrap;
+  min-width: 75px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ignore-all-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 2px 8px rgba(178, 106, 69, 0.12);
+}
+
+.ignore-all-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(160, 87, 54, 0.2);
+  border-top-color: #a05736;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .undocumented-chips {

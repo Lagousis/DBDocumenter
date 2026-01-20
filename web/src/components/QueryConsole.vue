@@ -23,6 +23,15 @@
           </button>
           <button 
             type="button" 
+            class="secondary-button icon-button" 
+            @click="toggleComment" 
+            :disabled="!sql.trim()" 
+            title="Comment/Uncomment lines (Ctrl+/)"
+          >
+            --
+          </button>
+          <button 
+            type="button" 
             class="secondary-button ai-button" 
             @click="handleAiAssist" 
             :disabled="aiLoading || !sql.trim()" 
@@ -46,10 +55,12 @@
     </div>
     <div class="editor-container" :style="{ height: sessionStore.queryEditorHeight + 'px' }">
       <textarea
+        ref="textareaRef"
         v-model="sql"
         spellcheck="false"
         placeholder="SELECT * FROM your_table LIMIT 10;"
         @input="handleInput"
+        @keydown="handleKeyDown"
       ></textarea>
       <div class="resize-handle" @mousedown="startResize"></div>
     </div>
@@ -368,6 +379,7 @@ const isNavigatingHistory = ref(false);
 const aiLoading = ref(false);
 const aiErrorLoading = ref(false);
 const aiErrorResult = ref<QueryErrorAssistResponse | null>(null);
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
 
 // Initialize history with current value
 watch(() => props.tab.sql, (newVal) => {
@@ -411,18 +423,21 @@ function redo() {
 }
 
 async function handleAiAssist() {
-  if (!sql.value.trim()) return;
+  const { sql: queryToAssist, isSelection } = getSelectedOrFullSql();
+  
+  if (!queryToAssist.trim()) return;
+  
   aiLoading.value = true;
   aiErrorResult.value = null;
   try {
     const response = await assistQuery({
-      sql: sql.value,
+      sql: queryToAssist,
       project: sessionStore.activeProject,
       database: sessionStore.activeDatabase,
     });
-    // Update SQL with the response
+    // Update SQL with the response (either selection or full query)
     // This will trigger the watch and add to history, so it's undoable
-    sql.value = response.sql;
+    replaceSelectedOrFullSql(response.sql);
   } catch (error) {
     console.error("AI Assist failed", error);
     const msg = (error as any).response?.data?.detail || (error instanceof Error ? error.message : String(error));
@@ -435,12 +450,14 @@ async function handleAiAssist() {
 async function handleAiFix() {
   if (!errorMessage.value) return;
   
+  const { sql: queryToFix, isSelection } = getSelectedOrFullSql();
+  
   aiErrorLoading.value = true;
   aiErrorResult.value = null;
   
   try {
     const response = await assistQueryError({
-      sql: sql.value,
+      sql: queryToFix,
       error: errorMessage.value,
       project: sessionStore.activeProject,
       database: sessionStore.activeDatabase,
@@ -457,7 +474,7 @@ async function handleAiFix() {
 
 function applyAiFix() {
   if (aiErrorResult.value) {
-    sql.value = aiErrorResult.value.fixed_sql;
+    replaceSelectedOrFullSql(aiErrorResult.value.fixed_sql);
     aiErrorResult.value = null;
   }
 }
@@ -507,8 +524,15 @@ function closeSaveDialog(): void {
 
 async function run(): Promise<void> {
   aiErrorResult.value = null;
+  
+  const { sql: queryToRun, isSelection } = getSelectedOrFullSql();
+  
+  if (!queryToRun.trim()) {
+    return;
+  }
+  
   try {
-    await sessionStore.runQueryForTab(props.tab.id);
+    await sessionStore.runQueryForTab(props.tab.id, queryToRun);
   } catch (error) {
     // error message stored on tab state; optionally log for debugging
     if (import.meta.env.DEV) {
@@ -519,6 +543,132 @@ async function run(): Promise<void> {
 
 function copyToNewTab(): void {
   sessionStore.createQueryTab({ sql: sql.value });
+}
+
+function getSelectedOrFullSql(): { sql: string; isSelection: boolean } {
+  if (!textareaRef.value) {
+    return { sql: sql.value, isSelection: false };
+  }
+  
+  const textarea = textareaRef.value;
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  
+  // Check if there's a selection
+  if (start !== end) {
+    const selectedText = sql.value.substring(start, end).trim();
+    if (selectedText) {
+      return { sql: selectedText, isSelection: true };
+    }
+  }
+  
+  return { sql: sql.value, isSelection: false };
+}
+
+function replaceSelectedOrFullSql(newSql: string): void {
+  if (!textareaRef.value) {
+    sql.value = newSql;
+    return;
+  }
+  
+  const textarea = textareaRef.value;
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  
+  // Check if there was a selection
+  if (start !== end && sql.value.substring(start, end).trim()) {
+    // Replace only the selected text
+    const before = sql.value.substring(0, start);
+    const after = sql.value.substring(end);
+    sql.value = before + newSql + after;
+    
+    // Set selection to the new text
+    setTimeout(() => {
+      if (textareaRef.value) {
+        textareaRef.value.setSelectionRange(start, start + newSql.length);
+        textareaRef.value.focus();
+      }
+    }, 0);
+  } else {
+    // Replace the entire SQL
+    sql.value = newSql;
+  }
+}
+
+function handleKeyDown(event: KeyboardEvent): void {
+  // Handle Ctrl+/ for comment/uncomment
+  if ((event.ctrlKey || event.metaKey) && event.key === '/') {
+    event.preventDefault();
+    toggleComment();
+  }
+}
+
+function toggleComment(): void {
+  if (!textareaRef.value) return;
+  
+  const textarea = textareaRef.value;
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const text = sql.value;
+  
+  // Find the start and end of lines involved
+  let lineStart = start;
+  while (lineStart > 0 && text[lineStart - 1] !== '\n') {
+    lineStart--;
+  }
+  
+  let lineEnd = end;
+  while (lineEnd < text.length && text[lineEnd] !== '\n') {
+    lineEnd++;
+  }
+  
+  // Extract the lines
+  const selectedText = text.substring(lineStart, lineEnd);
+  const lines = selectedText.split('\n');
+  
+  // Determine if we should comment or uncomment
+  // Count lines that start with -- (ignoring leading whitespace)
+  const commentedLines = lines.filter(line => line.trimStart().startsWith('--')).length;
+  const shouldUncomment = commentedLines > lines.length / 2;
+  
+  // Process each line
+  const processedLines = lines.map(line => {
+    if (shouldUncomment) {
+      // Remove comment
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith('--')) {
+        // Find where the content starts (after --)
+        const leadingWhitespace = line.substring(0, line.length - trimmed.length);
+        const afterComment = trimmed.substring(2);
+        // Remove one space after -- if it exists
+        const content = afterComment.startsWith(' ') ? afterComment.substring(1) : afterComment;
+        return leadingWhitespace + content;
+      }
+      return line;
+    } else {
+      // Add comment
+      const trimmed = line.trimStart();
+      if (trimmed && !trimmed.startsWith('--')) {
+        const leadingWhitespace = line.substring(0, line.length - trimmed.length);
+        return leadingWhitespace + '-- ' + trimmed;
+      }
+      return line;
+    }
+  });
+  
+  const newSelectedText = processedLines.join('\n');
+  const newText = text.substring(0, lineStart) + newSelectedText + text.substring(lineEnd);
+  
+  // Update the SQL (this will trigger history)
+  sql.value = newText;
+  
+  // Restore selection in next tick
+  setTimeout(() => {
+    if (textareaRef.value) {
+      textareaRef.value.setSelectionRange(lineStart, lineStart + newSelectedText.length);
+      textareaRef.value.focus();
+    }
+  }, 0);
 }
 
 function formatCell(cell: unknown): string {
